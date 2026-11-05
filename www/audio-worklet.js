@@ -10,12 +10,25 @@
 //    after on-time packets), so late packets don't make it speed up or slow
 //    down, while clock drift between the host and this audio device, or a
 //    target that grew, is absorbed without a dropout,
-//  - jumps ahead only beyond target + 300 ms, crossfading old and new,
+//  - jumps ahead only beyond target + 300 ms, crossfading old and new (in
+//    the first second after a (re)start already beyond target + 20 ms: the
+//    rest of a backlog that arrives after a stall would otherwise leave the
+//    buffer, and the A/V offset, a few hundred ms too high for half a minute),
+//  - a gap in the host timestamps (the guest produced nothing for a while,
+//    pve-h264d's clock jumped) is played as silence, faded out and in, so
+//    the buffer keeps its level and the audio after it its timing; before,
+//    every such gap drained the buffer for good, the rate control could only
+//    refill it at 0.5 % and the next few gaps ran it dry,
 //  - measures how bursty the device pulls audio (some render 10-85 ms in one
 //    go instead of a quantum every 2.7 ms): the buffer has to hold a whole
 //    burst on top of the network jitter, so the main thread adds it to target,
 //  - every level change is a gain ramp (5 ms): it fades out just before the
 //    buffer runs dry and back in when it refills, so dropouts never click.
+//  - plays at the rate the source really delivers, measured from the host
+//    timestamps over 5-20 s (frames written / host time they cover). A
+//    VM started before timer-period=5000 was added to its -audiodev gets
+//    ~2-3 % fewer samples than 48 kHz from QEMU; the ±0.5 % above can't
+//    follow that and ran dry every few seconds. Shown as "source" in the stats.
 // Resampling (drift control, a context not at 48 kHz) uses 4-point Hermite
 // interpolation, which keeps the treble that linear interpolation dulls.
 // Every chunk carries the host timestamp (pve-h264d, CLOCK_MONOTONIC) of its
@@ -48,17 +61,48 @@ class H264AudioPlayer extends AudioWorkletProcessor {
         this.burst = 0;      // ms: worst render burst (device pull) of the last 10 s
         this.under = 0;
         this.skips = 0;
+        this.end = 0;        // host time where the last chunk ends (µs)
+        this.fadeIn = 0;     // frames of the next chunk still to fade in
+        this.gaps = 0;
+        this.hist = [];      // [w, end] about once a second: the source's real rate
+        this.histAt = 0;
+        this.src = 1;        // source rate / 48 kHz
         this.lastReport = 0;
+        this.startAt = -1;   // context time playback last (re)started
         this.port.onmessage = (e) => {
             const m = e.data;
             if (m.l) this.push(m);
             else if (m.target !== undefined) this.target = Math.max(240, Math.round(m.target * MS));
-            else if (m.reset) { this.w = this.r = 0; this.chunks = []; this.playing = false; this.g = 0; this.xf = 0; }
+            else if (m.reset) { this.w = this.r = 0; this.chunks = []; this.playing = false; this.g = 0; this.xf = 0; this.end = 0; this.hist = []; }
         };
+    }
+
+    // a gap of k frames before the next chunk: fade out what is buffered, then silence
+    silence(k) {
+        const f = Math.min(FADE, Math.floor(this.w - this.r) - 3);
+        for (let i = 0; i < f; i++) {
+            const p = (this.w - f + i) % RING, g = (f - 1 - i) / f;
+            this.L[p] *= g; this.R[p] *= g;
+        }
+        for (let i = 0; i < k; i++) {
+            const p = (this.w + i) % RING;
+            this.L[p] = this.R[p] = 0;
+        }
+        this.chunks.push({ start: this.w, ts: this.end });
+        this.w += k;
+        this.fadeIn = FADE;
+        this.gaps++;
     }
 
     push(m) {
         const n = m.l.length;
+        if (this.end && m.ts) {
+            const gap = Math.round((m.ts - this.end) * SRC_RATE / 1e6);
+            // 5 ms+: pve-h264d's clock only moves by < 1.5 ms otherwise
+            if (gap >= 5 * MS && gap <= 300 * MS && this.playing && this.w + gap + n - this.r < RING - 512) this.silence(gap);
+            else if (Math.abs(gap) >= 5 * MS) this.hist = []; // frames and host time part ways: start over
+        }
+        if (m.ts) this.end = m.ts + n * 1e6 / SRC_RATE;
         if (this.w + n - this.r > RING - 512) { // overflow (renderer stalled ~2 s): keep the newest
             this.r = this.w + n - this.target;
             this.g = 0; this.xf = 0;
@@ -69,8 +113,13 @@ class H264AudioPlayer extends AudioWorkletProcessor {
             this.L[k] = m.l[i];
             this.R[k] = m.r[i];
         }
+        for (let i = 0; this.fadeIn > 0 && i < n; i++, this.fadeIn--) {
+            const k = (this.w + i) % RING, g = 1 - this.fadeIn / FADE;
+            this.L[k] *= g; this.R[k] *= g;
+        }
         this.chunks.push({ start: this.w, ts: m.ts });
         this.w += n;
+        if (m.ts && currentTime - this.histAt >= 1) this.measureSource();
         const fill = this.w - this.r;
         if (fill > this.peakCur) this.peakCur = fill;
     }
@@ -110,6 +159,17 @@ class H264AudioPlayer extends AudioWorkletProcessor {
         this.speed = s;
     }
 
+    // frames per host second over the last 5-20 s, relative to 48 kHz
+    measureSource() {
+        this.histAt = currentTime;
+        const h = this.hist;
+        h.push([this.w, this.end]);
+        if (h.length > 21) h.shift();
+        if (h.length < 6) return;
+        const est = (h[h.length - 1][0] - h[0][0]) / ((h[h.length - 1][1] - h[0][1]) * SRC_RATE / 1e6);
+        if (est > 0.9 && est < 1.1) this.src = Math.abs(est - 1) > 0.002 ? est : 1; // else: clock drift, for rate()
+    }
+
     // How far rendering runs ahead of the wall clock varies by one device
     // pull: spread (max - min) per second, worst of the last 10 s.
     measureBursts() {
@@ -141,19 +201,21 @@ class H264AudioPlayer extends AudioWorkletProcessor {
             if (this.w - this.r > this.target + 480) this.r = this.w - this.target; // start right at target
             this.peakCur = this.peakPrev = this.w - this.r;
             this.peakSince = currentTime;
+            this.startAt = currentTime;
         }
         if (!this.playing) {
             oL.fill(0);
             if (oR !== oL) oR.fill(0);
         } else {
-            if (this.w - this.r - this.target > 300 * MS && !this.xf) {
+            const jump = currentTime - this.startAt < 1 ? 20 * MS : 300 * MS;
+            if (this.w - this.r - this.target > jump && !this.xf) {
                 this.xr = this.r; this.xf = FADE; // jump ahead, crossfading
                 this.r = this.w - this.target;
                 this.peakCur = this.peakPrev = this.target;
                 this.skips++;
             }
             this.rate();
-            const step = this.ratio * this.speed;
+            const step = this.ratio * this.src * this.speed;
             ts = this.tsAt(this.r);
             const L = this.L, R = this.R;
             let i = 0;
@@ -186,8 +248,8 @@ class H264AudioPlayer extends AudioWorkletProcessor {
         if (currentTime - this.lastReport >= 0.04) {
             this.lastReport = currentTime;
             this.port.postMessage({ ts, ctime: currentTime, playing: this.playing,
-                fill: (this.w - this.r) * 1000 / SRC_RATE, under: this.under, skips: this.skips,
-                speed: this.speed, burst: this.burst, peak: Math.max(this.peakCur, this.peakPrev) * 1000 / SRC_RATE });
+                fill: (this.w - this.r) * 1000 / SRC_RATE, under: this.under, skips: this.skips, gaps: this.gaps,
+                speed: this.speed, src: this.src, burst: this.burst, peak: Math.max(this.peakCur, this.peakPrev) * 1000 / SRC_RATE });
         }
         return true;
     }

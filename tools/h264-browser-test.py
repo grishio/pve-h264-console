@@ -88,6 +88,20 @@ print("stats:\n" + (js("document.getElementById('stats').textContent") or ""))
 if action == "perf":
     for i in range(5):
         pump(2); print(f"t+{2*(i+1)}s:", (js("document.getElementById('stats').textContent") or "").replace("\n"," | "))
+if action == "audio":
+    # sound on (a click is the user gesture), lip sync per LIPSYNC=0/1, then
+    # the audio stats every 5 s for SECS seconds
+    js(f"localStorage.setItem('pve-h264-audio','1'); localStorage.setItem('pve-h264-lipsync','{os.environ.get('LIPSYNC', '1')}')")
+    call("Page.reload"); pump(5)
+    call("Input.dispatchMouseEvent", type="mousePressed", x=5, y=5, button="left", clickCount=1)
+    call("Input.dispatchMouseEvent", type="mouseReleased", x=5, y=5, button="left", clickCount=1)
+    t0 = time.time()
+    while time.time() - t0 < float(os.environ.get("SECS", "60")):
+        pump(5)
+        print(f"t+{time.time() - t0:3.0f}s:", js("""(() => { const a = __h264.audio;
+            return document.getElementById('stats').textContent.split('\\n').filter(l => /^(audio|A\\/V)/.test(l)).join(' | ') +
+              ` || aDelay ${a.aDelay.toFixed(0)} vDelay ${a.vDelay.toFixed(0)} held ${__h264.held} srcGaps ${a.srcGaps} gapsPlayed ${a.gapsPlayed} underruns ${a.underTotal}`; })()"""))
+    print("drop log:", js("JSON.stringify(__h264.audio.dropLog)"))
 if action == "mouse":
     js("""(() => { const o = WebSocket.prototype.send; window.__sent = {};
         WebSocket.prototype.send = function (b) { const u = new Uint8Array(b.buffer || b);

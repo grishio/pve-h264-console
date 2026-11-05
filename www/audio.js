@@ -39,6 +39,15 @@ let opusOk = null; // AudioDecoder can decode Opus (probed)
 
 let ctx = null, node = null, gain = null, ctxStarting = null;
 let decoder = null;
+// Opus chunks in the decoder: { vts, ts }. Chromium's AudioDecoder ignores
+// the timestamps of all chunks but the first and counts samples from there,
+// so every gap in the guest's audio (silence, a stall, the daemon
+// re-anchoring) used to be lost and the host times drifted further behind
+// with each one (A/V offsets of minutes, "jitter" of seconds). The decoder
+// gets gap-free virtual timestamps instead (cumulative samples, which either
+// behaviour hands back unchanged) and the host time is looked up here.
+const decQ = [];
+let decSamples = 0, decLast = null;
 let sentMode = -1;
 
 // clock + delay estimates (ms, performance.now() timebase)
@@ -60,9 +69,14 @@ let penalty = 0;                   // after real underruns
 let target = 30, sentTarget = 0;
 let fill = 0, lastUnder = 0, underruns = 0, underTotal = 0, lastPacket = 0, packets = 0, bytes = 0;
 let streamStart = 0; // packets (re)started flowing: startup dropouts don't count
+let pktEnd = 0;                      // host time (µs) where the last packet ends
+const srcGaps = [];                  // when the source itself paused (recent)
+const pendUnder = [];                // underruns not judged yet: { at, flowing }
+let gapsPlayed = 0;                  // worklet: timestamp gaps played as silence
 let audioOnAt = 0;   // sound turned on: no jitter history yet, start safe
 let workletPlaying = false;
 let speed = 1, peakFill = 0;       // worklet: playback rate (drift control), peak fill
+let srcRate = 1;                   // worklet: source rate / 48 kHz, from the timestamps
 let burst = 0;                     // worklet: ms the output device pulls in one go
 
 function clockObserve(hostUs, now) {
@@ -105,7 +119,12 @@ export function onPacket(dv, off, len) {
     const n = dv.getUint16(off + 14, true);
     const data = new Uint8Array(dv.buffer, dv.byteOffset + off + 16, len - 16);
     clockObserve(ts, now);
-    if (now - lastPacket > 500) streamStart = now;
+    if (now - lastPacket > 500) { streamStart = now; pktEnd = 0; }
+    // the source itself paused (the guest stopped its stream, QEMU stalled):
+    // the daemon's timestamps jump. Running dry over such a gap is not a
+    // dropout the buffer could have prevented.
+    if (pktEnd && ts - pktEnd > 15000) { srcGaps.push(now); if (srcGaps.length > 8) srcGaps.shift(); }
+    pktEnd = ts + n * 1e6 / RATE;
     lastPacket = now; packets++; bytes += len;
     if (!node || sentMode === MODE.OFF) return;
     if (codec === MODE.PCM) {
@@ -118,8 +137,12 @@ export function onPacket(dv, off, len) {
         post(l, r, ts);
     } else if (codec === MODE.OPUS) {
         if (!decoder || decoder.state === 'closed') openDecoder();
+        const vts = Math.round(decSamples * 1e6 / RATE);
+        decSamples += n;
+        decQ.push({ vts, ts });
+        if (decQ.length > 200) decQ.shift(); // decoder stuck: don't grow forever
         try {
-            decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
+            decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: vts, data }));
         } catch (e) { console.warn('audio decode', e); decoder = null; }
     }
 }
@@ -127,6 +150,7 @@ export function onPacket(dv, off, len) {
 function post(l, r, ts) {
     const now = performance.now();
     node.port.postMessage({ l, r, ts }, [l.buffer, r.buffer]);
+    if (!ts) return;
     const d = now - ts / 1000; // + an unknown constant, cancelled by max - min
     if (now - jit.since >= 1000) {
         jit.hi[jit.pos] = jit.cur; jit.lo[jit.pos] = jit.curLo;
@@ -145,10 +169,22 @@ function post(l, r, ts) {
     }
 }
 
+// host time of a decoded chunk from its virtual timestamp
+function hostTs(vts) {
+    while (decQ.length && decQ[0].vts < vts - 2000) decQ.shift(); // chunks the decoder dropped
+    let e = null;
+    if (decQ.length && decQ[0].vts <= vts + 2000) e = decQ.shift();
+    else if (decLast) e = decLast; // not ours (e.g. a decoder flushing extra output): extrapolate
+    if (!e) return 0;
+    decLast = e;
+    return e.ts + (vts - e.vts);
+}
+
 function openDecoder() {
+    decQ.length = 0; decSamples = 0; decLast = null;
     decoder = new AudioDecoder({
         output: (ad) => {
-            const n = ad.numberOfFrames, ts = ad.timestamp;
+            const n = ad.numberOfFrames, ts = hostTs(ad.timestamp);
             const l = new Float32Array(n), r = new Float32Array(n);
             try {
                 ad.copyTo(l, { planeIndex: 0, format: 'f32-planar' });
@@ -176,15 +212,24 @@ function onReport(m) {
     fill = m.fill;
     workletPlaying = m.playing;
     if (m.speed) { speed = m.speed; peakFill = m.peak; }
+    if (m.src) srcRate = m.src;
     if (m.burst !== undefined && Math.abs(m.burst - burst) >= 1) { burst = m.burst; updateTarget(); }
+    if (m.gaps !== undefined) gapsPlayed = m.gaps;
     if (m.under > lastUnder) {
-        // an underrun while packets keep coming means the buffer is too small
-        if (now - lastPacket < 60 && now - streamStart > 3000) {
+        pendUnder.push({ at: now, flowing: now - lastPacket < 60 && now - streamStart > 3000 });
+        lastUnder = m.under;
+    }
+    // an underrun while packets keep coming means the buffer is too small;
+    // running dry while the source itself paused does not (its timestamps
+    // jump, which pve-h264d may only decide up to 30 ms after the first
+    // packet that follows, so each one is judged a little later)
+    while (pendUnder.length && now - pendUnder[0].at > 300) {
+        const u = pendUnder.shift();
+        if (u.flowing && !srcGaps.some((g) => Math.abs(g - u.at) < 300)) {
             penalty = Math.min(penalty + 15, 100); underruns++; underTotal++;
-            dropLog.push({ at: Math.round(now - streamStart), target: Math.round(target), jitter: Math.round(jit.peak) });
+            dropLog.push({ at: Math.round(u.at - streamStart), target: Math.round(target), jitter: Math.round(jit.peak) });
             if (dropLog.length > 20) dropLog.shift();
         }
-        lastUnder = m.under;
     }
     if (m.playing && m.ts) {
         let heard;
@@ -329,6 +374,7 @@ export function statsLine() {
     s += `  jitter ${jit.peak.toFixed(0)} ms`;
     if (burst > 6) s += `  device ${burst.toFixed(0)} ms`;
     if (Math.abs(speed - 1) >= 0.0005) s += `  rate ${speed > 1 ? '+' : ''}${((speed - 1) * 100).toFixed(1)} %`;
+    if (srcRate !== 1) s += `  source ${srcRate > 1 ? '+' : ''}${((srcRate - 1) * 100).toFixed(1)} %`;
     if (underTotal) s += `  dropouts ${underTotal}${underruns ? ' (+' + underruns + ')' : ''}`;
     if (audioActive() && performance.now() - vAt < 1000) {
         const av = aDelay - vDelay;
@@ -344,9 +390,9 @@ export const debug = {
     get extra() { return extra; }, get target() { return target; }, get fill() { return fill; },
     get active() { return audioActive(); }, get mode() { return sentMode; }, get opusOk() { return opusOk; },
     get underTotal() { return lastUnder; }, get dropLog() { return dropLog; }, get dropouts() { return underTotal; }, get jitter() { return jit.peak; }, get penalty() { return penalty; },
-    get speed() { return speed; }, get burst() { return burst; }, get peakFill() { return peakFill; },
+    get speed() { return speed; }, get srcRate() { return srcRate; }, get burst() { return burst; }, get peakFill() { return peakFill; },
     get ctxState() { return ctx ? ctx.state : 'none'; }, get server() { return server; },
-    get clockOff() { return clockOff(); },
+    get clockOff() { return clockOff(); }, get gapsPlayed() { return gapsPlayed; }, get srcGaps() { return srcGaps.length; },
     get latency() {
         if (!ctx) return null;
         const o = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : {};
