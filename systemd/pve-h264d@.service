@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Proxmox H.264 GPU console for VM %i
+Documentation=file:///usr/share/doc/pve-h264-console/documentation.md
+After=pve-cluster.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/sbin/pve-h264d %i
+Restart=no
+TimeoutStartSec=25
+# keep the capture/encode loop responsive under host load
+Nice=-10
+IOSchedulingClass=realtime

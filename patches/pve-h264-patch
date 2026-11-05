@@ -1,0 +1,539 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+"""Apply / revert the pve-h264-console integration into Proxmox VE files.
+
+Every change is a pure *insertion* wrapped in BEGIN/END marker lines, anchored
+on a unique snippet of the original file. That makes the patcher:
+  * idempotent (already-applied blocks are skipped),
+  * safe after package upgrades (dpkg restores pristine files, the apt hook
+    re-runs `apply`),
+  * trivially revertible (`revert` deletes the marked blocks).
+
+If an anchor is not found (Proxmox changed the code), that patch is reported
+and skipped; nothing is half-applied.
+
+usage: pve-h264-patch apply|revert|status|gpu-check [--quiet] [--no-restart]
+"""
+import os
+import re
+import subprocess
+import sys
+
+TAG = "pve-h264-console"
+
+PERL_BEGIN = f"# {TAG} BEGIN"
+PERL_END = f"# {TAG} END"
+JS_BEGIN = f"// {TAG} BEGIN"
+JS_END = f"// {TAG} END"
+
+QEMUSERVER = "/usr/share/perl5/PVE/QemuServer.pm"
+API_QEMU = "/usr/share/perl5/PVE/API2/Qemu.pm"
+PVEPROXY = "/usr/share/perl5/PVE/Service/pveproxy.pm"
+ANYEVENT = "/usr/share/perl5/PVE/APIServer/AnyEvent.pm"
+MANAGERJS = "/usr/share/pve-manager/js/pvemanagerlib.js"
+
+API_METHODS = r'''
+__PACKAGE__->register_method({
+    name => 'h264proxy',
+    path => '{vmid}/h264proxy',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Console']],
+    },
+    description => "Start the H.264 console daemon for a VM (if needed) and "
+        . "return a websocket ticket plus a one-time stream token.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+        },
+    },
+    returns => {
+        additionalProperties => 0,
+        properties => {
+            user => { type => 'string' },
+            ticket => { type => 'string' },
+            token => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $vmid = $param->{vmid};
+
+        PVE::QemuConfig->load_config($vmid); # VM exists on this node?
+        my $pid = PVE::QemuServer::check_running($vmid)
+            or die "VM $vmid is not running\n";
+        my $cmdline = PVE::Tools::file_get_contents("/proc/$pid/cmdline");
+        die "VM $vmid was started before the H.264 console was installed (no "
+            . "'-display dbus'). Shut it down and start it again to enable it.\n"
+            if $cmdline !~ m/dbus,p2p=yes/;
+
+        my $authpath = "/vms/$vmid";
+        my $ticket = PVE::AccessControl::assemble_vnc_ticket($authuser, $authpath);
+
+        open(my $rnd, '<', '/dev/urandom') or die "urandom: $!\n";
+        sysread($rnd, my $raw, 32) == 32 or die "urandom short read\n";
+        close($rnd);
+        my $token = unpack('H*', $raw);
+
+        my $dir = "/run/pve-h264/tokens/$vmid";
+        require File::Path;
+        File::Path::make_path($dir, { mode => 0700 });
+        chmod(0711, '/run/pve-h264');
+        chmod(0700, '/run/pve-h264/tokens');
+        if (opendir(my $dh, $dir)) { # expire stale tokens
+            for my $f (readdir($dh)) {
+                next if $f !~ m/^([0-9a-f]+)$/;
+                my $p = "$dir/$1";
+                my $mtime = (stat($p))[9] // 0;
+                unlink($p) if time() - $mtime > 120;
+            }
+            closedir($dh);
+        }
+        PVE::Tools::file_set_contents("$dir/$token", "$authuser\n", 0600);
+
+        eval {
+            PVE::Tools::run_command(
+                ['/bin/systemctl', 'start', "pve-h264d\@$vmid.service"],
+                timeout => 30,
+            );
+        };
+        if (my $err = $@) {
+            unlink("$dir/$token");
+            die "failed to start H.264 console daemon ($err) - see "
+                . "'journalctl -u pve-h264d\@$vmid'\n";
+        }
+
+        return { user => $authuser, ticket => $ticket, token => $token };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'h264websocket',
+    path => '{vmid}/h264websocket',
+    method => 'GET',
+    permissions => {
+        description => "You also need to pass a valid ticket (vncticket).",
+        check => ['perm', '/vms/{vmid}', ['VM.Console']],
+    },
+    description => "Opens a websocket to the H.264 console stream.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            vncticket => {
+                description => "Ticket from previous call to h264proxy.",
+                type => 'string',
+                maxLength => 512,
+            },
+        },
+    },
+    returns => {
+        type => "object",
+        properties => {
+            socket => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $vmid = $param->{vmid};
+
+        PVE::AccessControl::verify_vnc_ticket($param->{vncticket}, $authuser, "/vms/$vmid");
+
+        # the stream itself is additionally protected by the one-time token
+        # that the client sends as first message (checked by pve-h264d)
+        return { socket => "/run/pve-h264/$vmid.sock" };
+    },
+});
+
+'''
+
+JS_HELPERS = r'''
+        h264IsDefault: function () {
+            try {
+                return window.localStorage.getItem('pve-h264-default') === '1';
+            } catch (e) {
+                return false;
+            }
+        },
+
+        openH264Viewer: function (vmid, nodename, vmname) {
+            let url = Ext.Object.toQueryString({
+                console: 'kvm',
+                h264: 1,
+                vmid: vmid,
+                vmname: vmname,
+                node: nodename,
+            });
+            let nw = window.open('?' + url, '_blank', 'innerWidth=1280,innerheight=760');
+            if (nw) {
+                nw.focus();
+            }
+        },
+
+'''
+
+JS_MENUITEM = r'''        {
+            xtype: 'menuitem',
+            text: 'H.264',
+            iconCls: 'fa fa-film',
+            type: 'h264',
+            listeners: {
+                beforerender: function (item) {
+                    let view = item.up('button');
+                    item.setHidden(!view || view.consoleType !== 'kvm');
+                },
+            },
+            handler: function (button) {
+                let view = this.up('button');
+                view.openConsole(button.type);
+            },
+        },
+'''
+
+# (file, mode, anchor, block, comment-style)
+#   mode 'after'  -> insert block right after anchor
+#   mode 'before' -> insert block right before anchor
+PATCHES = [
+    # Guest audio: the VM's audio0 backend (default 'spice') becomes QEMU's
+    # D-Bus backend, handed to the D-Bus display, where pve-h264d picks it up
+    # (daemon/audio.c). 'driver=none' is left alone; 'audio = 0' in
+    # /etc/pve-h264/h264d.conf keeps audio on SPICE (remote-viewer) instead.
+    ("qemu-server: add -display dbus,p2p=yes", QEMUSERVER, "after",
+     "        push @$cmd, '-vnc', \"unix:$socket,password=on\";\n",
+     "        if ($vga->{type} ne 'virtio-gl' && ($conf->{args} // '') !~ m/-display\\b/) {\n"
+     "            my $display = 'dbus,p2p=yes';\n"
+     "            my $h264_audio = 1;\n"
+     "            if (open(my $fh, '<', '/etc/pve-h264/h264d.conf')) {\n"
+     "                while (my $l = <$fh>) { $h264_audio = $1 if $l =~ m/^\\s*audio\\s*=\\s*(\\d+)/; }\n"
+     "                close($fh);\n"
+     "            }\n"
+     "            for (my $i = 0; $h264_audio && $i < $#$devices; $i++) {\n"
+     "                next if $devices->[$i] ne '-audiodev'\n"
+     "                    || $devices->[$i + 1] !~ m/^spice,id=([\\w-]+)$/;\n"
+     "                $devices->[$i + 1] = \"dbus,id=$1,out.frequency=48000,out.channels=2\";\n"
+     "                $display .= \",audiodev=$1\";\n"
+     "                last;\n"
+     "            }\n"
+     "            push @$cmd, '-display', $display;\n"
+     "        }\n",
+     "perl"),
+
+    # The spice agent port normally goes to the SPICE server, which turns
+    # monitor configs into the same SetUIInfo hint the Windows virtio-gpu driver
+    # ignores. On a D-Bus chardev pve-h264d talks to the agent itself and sends
+    # the resolution to it directly (see daemon/vdagent.c).
+    ("qemu-server: spice agent port on D-Bus", QEMUSERVER, "after",
+     "        push @$devices, '-device', \"virtserialport,chardev=vdagent,name=com.redhat.spice.0\";\n",
+     "        if ($vga->{type} ne 'virtio-gl' && ($conf->{args} // '') !~ m/-display\\b/) {\n"
+     "            s/^spicevmc,id=vdagent,name=vdagent$/dbus,id=vdagent,name=com.redhat.spice.0/\n"
+     "                for @$devices;\n"
+     "        }\n",
+     "perl"),
+
+    ("API: h264proxy + h264websocket", API_QEMU, "before",
+     "__PACKAGE__->register_method({\n    name => 'spiceproxy',\n",
+     API_METHODS, "perl"),
+
+    ("pveproxy: serve /h264/", PVEPROXY, "after",
+     "    add_dirs($dirs, '/xtermjs/' => \"$basedirs->{xtermjs}/\");\n",
+     "    add_dirs($dirs, '/h264/' => '/usr/share/pve-h264-console/')\n"
+     "        if -d '/usr/share/pve-h264-console';\n",
+     "perl"),
+
+    ("pveproxy: refresh browser cache of the patched UI", PVEPROXY, "after",
+     "    my $version = PVE::pvecfg::version();\n",
+     "    # the UI script is loaded as pvemanagerlib.js?ver=<pve version>, which our\n"
+     "    # patch doesn't change, and pveproxy sends no Cache-Control for it: browsers\n"
+     "    # would keep running the cached, unpatched copy. Tag it with the file mtime.\n"
+     "    if (-d '/usr/share/pve-h264-console') {\n"
+     "        my $js_mtime = (stat(\"$basedirs->{manager}/js/pvemanagerlib.js\"))[9] // 0;\n"
+     "        $version .= \"-h264.$js_mtime\";\n"
+     "    }\n",
+     "perl"),
+
+    ("pveproxy: ?console=kvm&h264=1 page", PVEPROXY, "before",
+     "    my $page = '';\n    my $template = Template->new({ ABSOLUTE => 1 });\n",
+     "    if (defined($args->{console}) && $args->{h264} && -d '/usr/share/pve-h264-console') {\n"
+     "        $dir = '/usr/share/pve-h264-console';\n"
+     "        $vars->{h264ver} = get_path_mtime('/usr/share/pve-h264-console');\n"
+     "    }\n",
+     "perl"),
+
+    ("pveproxy: TCP_NODELAY on websocket relay", ANYEVENT, "after",
+     "\n            $reqstate->{proxyhdl}->timeout(0);\n"
+     "            $reqstate->{proxyhdl}->on_read($proxyhdlreader);\n"
+     "            $reqstate->{hdl}->on_read($hdlreader);\n",
+     "            # low latency for interactive consoles: disable Nagle on both legs\n"
+     "            eval { $reqstate->{proxyhdl}->no_delay(1); };\n"
+     "            eval { $reqstate->{hdl}->no_delay(1); };\n",
+     "perl"),
+
+    ("UI: H.264 viewer helpers", MANAGERJS, "before",
+     "        openVNCViewer: function (vmtype, vmid, nodename, vmname, cmd) {\n",
+     JS_HELPERS, "js"),
+
+    ("UI: openConsoleWindow('h264')", MANAGERJS, "before",
+     "            if (viewer === 'html5') {\n                PVE.Utils.openVNCViewer(consoleType, vmid, nodename, vmname, cmd);\n",
+     "            if (viewer === 'h264') {\n"
+     "                PVE.Utils.openH264Viewer(vmid, nodename, vmname);\n"
+     "                return;\n"
+     "            }\n",
+     "js"),
+
+    ("UI: default viewer", MANAGERJS, "after",
+     "            let dv = PVE.UIOptions.options.console || (type === 'kvm' ? 'vv' : 'xtermjs');\n",
+     "            if (type === 'kvm' && PVE.Utils.h264IsDefault()) {\n"
+     "                return 'h264';\n"
+     "            }\n",
+     "js"),
+
+    ("UI: Console menu entry", MANAGERJS, "after",
+     "            text: 'noVNC',\n            iconCls: 'pve-itype-icon-novnc',\n"
+     "            type: 'html5',\n            handler: function (button) {\n"
+     "                let view = this.up('button');\n                view.openConsole(button.type);\n"
+     "            },\n        },\n",
+     JS_MENUITEM, "js"),
+
+    ("UI: Console tab uses H.264 when default", MANAGERJS, "after",
+     "                    queryDict[type] = 1;\n                    PVE.Utils.cleanEmptyObjectKeys(queryDict);\n",
+     "                    if (me.consoleType === 'kvm' && queryDict.novnc && PVE.Utils.h264IsDefault()) {\n"
+     "                        delete queryDict.novnc;\n"
+     "                        queryDict.h264 = 1;\n"
+     "                    }\n",
+     "js"),
+]
+
+def markers(style):
+    return (PERL_BEGIN, PERL_END) if style == "perl" else (JS_BEGIN, JS_END)
+
+
+def wrap(block, style, name):
+    b, e = markers(style)
+    indent = re.match(r"\s*", block).group(0) if block.strip() else ""
+    indent = indent.split("\n")[-1]
+    return f"{indent}{b} {name}\n{block}{indent}{e}\n"
+
+
+class MarkerError(Exception):
+    pass
+
+
+def strip_blocks(text):
+    """Remove our BEGIN..END blocks. Refuses (MarkerError) if the markers are
+    not properly paired, instead of guessing and possibly deleting real code
+    (e.g. everything after a BEGIN whose END was edited away by hand)."""
+    out, skip, begin_line = [], False, 0
+    for n, line in enumerate(text.splitlines(keepends=True), 1):
+        s = line.strip()
+        if s.startswith((PERL_BEGIN, JS_BEGIN)):
+            if skip:
+                raise MarkerError(f"line {n}: BEGIN inside the block opened at line {begin_line}")
+            skip, begin_line = True, n
+            continue
+        if s.startswith((PERL_END, JS_END)):
+            if not skip:
+                raise MarkerError(f"line {n}: END without BEGIN")
+            skip = False
+            continue
+        if not skip:
+            out.append(line)
+    if skip:
+        raise MarkerError(f"line {begin_line}: BEGIN without END")
+    return "".join(out)
+
+
+def write_atomic(path, text):
+    """Write via temp file + fsync + rename, so the file is never half-written."""
+    st = os.stat(path)
+    tmp = path + f".{TAG}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, st.st_mode & 0o7777)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.rename(tmp, path)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def marker_help(path, err):
+    return (f"{path}: unbalanced {TAG} markers ({err}); file left untouched. "
+            "Fix it by hand or restore the package file with "
+            "'apt install --reinstall <package>' (see: dpkg -S " + path + ")")
+
+
+def apply(quiet):
+    changed_files = set()
+    failed = []
+    by_file = {}
+    for p in PATCHES:
+        by_file.setdefault(p[1], []).append(p)
+    for path, plist in by_file.items():
+        if not os.path.exists(path):
+            failed.append(f"{path}: missing")
+            continue
+        orig = open(path).read()
+        # start from the pristine text so changed blocks are updated in place
+        try:
+            text = strip_blocks(orig)
+        except MarkerError as e:
+            failed.append(marker_help(path, e))
+            continue
+        for name, _, mode, anchor, block, style in plist:
+            n = text.count(anchor)
+            if n != 1:
+                failed.append(f"{name}: anchor found {n}x in {path}")
+                continue
+            w = wrap(block, style, name)
+            text = text.replace(anchor, anchor + w if mode == "after" else w + anchor)
+        if text != orig:
+            write_atomic(path, text)
+            changed_files.add(path)
+            if not quiet:
+                print(f"patched {path}")
+    for f in failed:
+        print(f"WARNING: {f}", file=sys.stderr)
+    return changed_files, failed
+
+
+def revert(quiet):
+    changed, failed = set(), []
+    for path in sorted({p[1] for p in PATCHES}):
+        if not os.path.exists(path):
+            continue
+        orig = open(path).read()
+        try:
+            text = strip_blocks(orig)
+        except MarkerError as e:
+            failed.append(marker_help(path, e))
+            continue
+        if text != orig:
+            write_atomic(path, text)
+            changed.add(path)
+            if not quiet:
+                print(f"reverted {path}")
+    for f in failed:
+        print(f"ERROR: {f}", file=sys.stderr)
+    return changed, failed
+
+
+def status():
+    ok = True
+    for name, path, _m, _a, _b, style in PATCHES:
+        b, _ = markers(style)
+        applied = os.path.exists(path) and f"{b} {name}\n" in open(path).read()
+        ok &= applied
+        print(f"[{'x' if applied else ' '}] {name}  ({path})")
+    return ok
+
+
+def _workers(svc):
+    """PIDs of the worker processes of a PVE daemon (children of MainPID)."""
+    main = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", svc],
+                          capture_output=True, text=True).stdout.strip()
+    if not main.isdigit() or main == "0":
+        return set()
+    try:
+        kids = open(f"/proc/{main}/task/{main}/children").read().split()
+    except OSError:
+        return set()
+    return {int(k) for k in kids}
+
+
+def restart(changed, quiet=False):
+    """Reload pvedaemon/pveproxy and WAIT until the old workers are gone.
+
+    `systemctl reload` returns immediately, but the old worker processes keep
+    serving requests (with the old code) for several seconds; calls to the
+    H.264 API in that window fail with 501 'not implemented'."""
+    if not any(p.startswith("/usr/share/perl5/") for p in changed):
+        return  # JS only: no restart needed, browsers reload the file
+    import time
+    for svc in ("pvedaemon", "pveproxy"):
+        old = _workers(svc)
+        subprocess.run(["systemctl", "reload-or-restart", svc], check=False)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            alive = {pid for pid in old if os.path.exists(f"/proc/{pid}")}
+            new = _workers(svc) - old
+            if not alive and new:
+                break
+            time.sleep(0.25)
+        else:
+            print(f"WARNING: {svc} workers did not restart within 30 s", file=sys.stderr)
+            continue
+        if not quiet:
+            print(f"{svc}: reloaded ({len(new)} new workers)")
+
+
+def gpu_check(quiet):
+    """If the NVIDIA driver comes from DKMS, every installed kernel needs the
+    module built. A kernel installed without its headers silently gets none,
+    so NVENC disappears after booting it. (Can't be fixed from inside the apt
+    hook - dpkg holds the lock - so tell the admin exactly what to run.)"""
+    try:
+        st = subprocess.run(["dkms", "status"], capture_output=True, text=True).stdout
+    except OSError:
+        return True
+    if not re.search(r"^nvidia[/,]", st, re.M):
+        return True  # no NVIDIA DKMS driver: nothing to check
+    ok = True
+    for kver in sorted(os.listdir("/lib/modules")):
+        if not os.path.exists(f"/boot/vmlinuz-{kver}"):
+            continue  # leftover module dir of a removed kernel
+        built = re.search(rf"^nvidia[/,][^\n]*\b{re.escape(kver)}\b[^\n]*installed", st, re.M)
+        if built:
+            continue
+        ok = False
+        hdr = "" if os.path.exists(f"/lib/modules/{kver}/build") else f"apt install proxmox-headers-{kver} && "
+        print(f"pve-h264-console: WARNING kernel {kver} has no NVIDIA module - after booting it NVENC "
+              f"is unavailable (H.264 console falls back to CPU). Fix: {hdr}dkms autoinstall -k {kver}",
+              file=sys.stderr)
+    if ok and not quiet:
+        print("NVIDIA DKMS module present for all installed kernels")
+    return ok
+
+
+def main():
+    args = sys.argv[1:]
+    quiet = "--quiet" in args
+    norestart = "--no-restart" in args
+    cmd = next((a for a in args if not a.startswith("--")), "status")
+    if cmd == "apply":
+        changed, failed = apply(quiet)
+        if not norestart:
+            restart(changed, quiet)
+        sys.exit(1 if failed else 0)
+    elif cmd == "revert":
+        changed, failed = revert(quiet)
+        if not norestart:
+            restart(changed, quiet)
+        sys.exit(1 if failed else 0)
+    elif cmd == "status":
+        ok = status()
+        gpu_check(False)
+        sys.exit(0 if ok else 1)
+    elif cmd == "gpu-check":
+        sys.exit(0 if gpu_check(quiet) else 1)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

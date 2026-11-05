@@ -1,0 +1,4 @@
+daemon/*.o
+daemon/pve-h264d
+__pycache__/
+*.pyc
