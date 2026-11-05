@@ -435,6 +435,20 @@ version. If B has none (or an old one), A reports that instead of failing obscur
 `pve-h264-patch status` shows each patch. If a future Proxmox version changes
 an anchor, that single patch is reported and skipped (never half-applied).
 
+Before applying, `pve-h264-patch` checks the host (also on its own: `pve-h264-patch check`;
+`install.sh` runs it first and stops before installing anything). It needs:
+
+* `pve-manager` 9.0 or newer;
+* a QEMU (`/usr/bin/kvm`) that lists `dbus` under `-display help`, `-audiodev help` and
+  `-chardev help`. Without them the qemu-server patch would make **every** VM fail to start;
+* `PVE::AccessControl::assemble_vnc_ticket($username, $path, $port)` and
+  `verify_vnc_ticket($ticket, $username, $path, $port, $noerr)`. The API patch binds a relay
+  ticket to its relay id through `$port`; if that slot were `$noerr`, a bad ticket would pass.
+
+If any check fails (or can't be run), nothing is applied and blocks left from an earlier
+apply are removed, including when the apt hook runs after an upgrade or downgrade.
+`pve-h264-patch status` lists the failed checks.
+
 ## 6. Install / update / uninstall
 
 ### Requirements
@@ -1129,3 +1143,13 @@ offset.
   dry over a source gap no longer counts as a dropout.
   Test source options `:gaps[=ms]`, `:stalls[=ms]`, `:slow[=‰]`; browser
   test mode `audio`. Results in §10. The cluster relay was not involved.
+* 2026-11-05 — **Host compatibility check.** Nothing stopped an install on an
+  older Proxmox VE: on a QEMU without D-Bus display/audio/chardev backends the
+  qemu-server patch would have made every VM fail to start, and an older
+  ticket API could have taken the relay id as `$noerr`. `pve-h264-patch`
+  now checks pve-manager ≥ 9.0, QEMU's D-Bus backends and the ticket function
+  signatures before applying (`check` command, also run first by
+  `install.sh`); on failure it applies nothing and removes earlier blocks.
+  Tested on 9.2.25 (passes, files byte-identical after re-apply) and with
+  simulated failures (QEMU without dbus, failing or missing QEMU, old ticket
+  signatures, pve-manager 8.4, no pve-manager) on copies of the patched files.

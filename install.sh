@@ -4,6 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
+echo ">> checking host"
+if ! ./patches/pve-h264-patch check; then
+    echo "This host can't run pve-h264-console (see above). Nothing was installed." >&2
+    exit 1
+fi
+
 if ! pkg-config --exists libavcodec libswresample gio-2.0 2>/dev/null; then
     echo ">> installing build dependencies"
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q \

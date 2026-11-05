@@ -12,7 +12,12 @@ on a unique snippet of the original file. That makes the patcher:
 If an anchor is not found (Proxmox changed the code), that patch is reported
 and skipped; nothing is half-applied.
 
-usage: pve-h264-patch apply|revert|status|gpu-check [--quiet] [--no-restart]
+Before applying, the host is checked (see compat_problems): on an unsupported
+Proxmox VE, a QEMU without D-Bus display/audio/chardev, or a ticket API with a
+different signature, nothing is applied and blocks left from earlier are
+removed, so VMs keep starting and no API runs with the wrong ticket check.
+
+usage: pve-h264-patch apply|revert|status|check|gpu-check [--quiet] [--no-restart]
 """
 import os
 import re
@@ -31,6 +36,22 @@ API_QEMU = "/usr/share/perl5/PVE/API2/Qemu.pm"
 PVEPROXY = "/usr/share/perl5/PVE/Service/pveproxy.pm"
 ANYEVENT = "/usr/share/perl5/PVE/APIServer/AnyEvent.pm"
 MANAGERJS = "/usr/share/pve-manager/js/pvemanagerlib.js"
+ACCESSCONTROL = "/usr/share/perl5/PVE/AccessControl.pm"
+
+PVE_MIN = "9.0"
+# what qemu-server runs for VMs of the host's own architecture
+# (PVE::QemuServer::Helpers::get_command_for_arch)
+QEMU_BIN = "/usr/bin/kvm"
+# backends the qemu-server patch puts on the command line; a QEMU without any
+# of them refuses to start the VM
+QEMU_NEEDS = ("-display", "-audiodev", "-chardev")
+# the API patch passes the relay id as the ticket's 3rd/4th argument ($port).
+# Where that slot is something else (e.g. $noerr), a bad ticket would pass.
+TICKET_SIGS = (
+    ("assemble_vnc_ticket", r"my\s*\(\s*\$username\s*,\s*\$path\s*,\s*\$port\s*\)\s*=\s*@_\s*;"),
+    ("verify_vnc_ticket",
+     r"my\s*\(\s*\$ticket\s*,\s*\$username\s*,\s*\$path\s*,\s*\$port\s*,\s*\$noerr\s*\)\s*=\s*@_\s*;"),
+)
 
 API_METHODS = r'''
 __PACKAGE__->register_method({
@@ -406,6 +427,57 @@ PATCHES = [
      "js"),
 ]
 
+def _pve_version():
+    r = subprocess.run(["dpkg-query", "-W", "-f=${Version}", "pve-manager"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _qemu_backends(opt):
+    """Backend names QEMU lists for `<opt> help`, or None if it can't be asked.
+    (`help` only prints the list and exits; no VM is started.)"""
+    try:
+        r = subprocess.run([QEMU_BIN, opt, "help"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return {line.strip() for line in r.stdout.splitlines()}
+
+
+def compat_problems():
+    """Reasons this host can't take the integration; empty if it can.
+
+    Fails closed: anything that can't be checked counts as a problem."""
+    problems = []
+    ver = _pve_version()
+    if not ver:
+        problems.append("pve-manager is not installed")
+    elif subprocess.run(["dpkg", "--compare-versions", ver, "lt", PVE_MIN]).returncode == 0:
+        problems.append(f"Proxmox VE {ver} is not supported (needs {PVE_MIN} or newer)")
+
+    for opt in QEMU_NEEDS:
+        names = _qemu_backends(opt)
+        if names is None:
+            problems.append(f"could not run '{QEMU_BIN} {opt} help' to check QEMU")
+        elif "dbus" not in names:
+            problems.append(f"QEMU ({QEMU_BIN}) has no D-Bus {opt[1:]} backend; "
+                            "VMs would fail to start with the qemu-server patch")
+
+    try:
+        ac = open(ACCESSCONTROL).read()
+    except OSError as e:
+        ac = None
+        problems.append(f"{ACCESSCONTROL}: {e.strerror}")
+    for sub, sig in TICKET_SIGS if ac is not None else ():
+        m = re.search(rf"^sub {sub}\b[^{{]*\{{\s*{sig}", ac, re.M)
+        if not m:
+            problems.append(f"PVE::AccessControl::{sub} has an unexpected signature "
+                            "(libpve-access-control too old or changed)")
+    return problems
+
+
 def markers(style):
     return (PERL_BEGIN, PERL_END) if style == "perl" else (JS_BEGIN, JS_END)
 
@@ -607,6 +679,16 @@ def main():
     norestart = "--no-restart" in args
     cmd = next((a for a in args if not a.startswith("--")), "status")
     if cmd == "apply":
+        problems = compat_problems()
+        if problems:
+            for p in problems:
+                print(f"ERROR: {p}", file=sys.stderr)
+            print(f"{TAG}: this host is not supported; nothing applied, "
+                  "earlier integration (if any) removed", file=sys.stderr)
+            changed, _failed = revert(quiet)
+            if not norestart:
+                restart(changed, quiet)
+            sys.exit(1)
         changed, failed = apply(quiet)
         if not norestart:
             restart(changed, quiet)
@@ -618,8 +700,18 @@ def main():
         sys.exit(1 if failed else 0)
     elif cmd == "status":
         ok = status()
+        problems = compat_problems()
+        for p in problems:
+            print(f"ERROR: {p}")
         gpu_check(False)
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if ok and not problems else 1)
+    elif cmd == "check":
+        problems = compat_problems()
+        for p in problems:
+            print(f"ERROR: {p}", file=sys.stderr)
+        if not problems and not quiet:
+            print(f"host is supported (Proxmox VE {_pve_version()}, QEMU with D-Bus display)")
+        sys.exit(1 if problems else 0)
     elif cmd == "gpu-check":
         sys.exit(0 if gpu_check(quiet) else 1)
     else:

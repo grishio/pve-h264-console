@@ -29,7 +29,7 @@ No client software. No extra ports. No QEMU fork. It's one more entry in the
 
 ## 📋 What you need
 
-- **Proxmox VE 9.x**
+- **Proxmox VE 9.x** (the installer checks this, and that QEMU has D-Bus display support)
 - **An encoder:** an NVIDIA GPU with NVENC, or an Intel/AMD GPU with VA-API. A plain CPU
   works too, just less efficiently.
 - **A modern browser** with WebCodecs: Chrome/Edge 94+, Safari 16.4+ or Firefox 130+
