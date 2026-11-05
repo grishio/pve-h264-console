@@ -34,6 +34,8 @@ No client software. No extra ports. No QEMU fork. It's one more entry in the
   works too, just less efficiently.
 - **A modern browser** with WebCodecs: Chrome/Edge 94+, Safari 16.4+ or Firefox 130+
 - **A LAN or VPN** connection to your Proxmox host
+- **In a cluster:** install it on every node, the same version on each. You can then open any
+  VM's console from whichever node's web UI you're logged in to
 - **Recommended VM settings:** `vga: virtio` for 60 fps, and an audio device if you want sound
 
 > Using an Intel iGPU? Proxmox doesn't ship the encoding driver by default. See

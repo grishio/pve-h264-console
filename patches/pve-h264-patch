@@ -38,7 +38,10 @@ __PACKAGE__->register_method({
     path => '{vmid}/h264proxy',
     method => 'POST',
     protected => 1,
-    proxyto => 'node',
+    # no proxyto: like vncproxy this runs on the node the browser is connected
+    # to, because that node's pveproxy serves the websocket. For a VM on another
+    # cluster node it prepares the daemon there and relays the stream over the
+    # cluster's SSH.
     permissions => {
         check => ['perm', '/vms/{vmid}', ['VM.Console']],
     },
@@ -57,6 +60,12 @@ __PACKAGE__->register_method({
             user => { type => 'string' },
             ticket => { type => 'string' },
             token => { type => 'string' },
+            relay => {
+                type => 'string',
+                optional => 1,
+                description => "Relay id to pass to h264websocket (VM on another node).",
+            },
+            upid => { type => 'string', optional => 1 },
         },
     },
     code => sub {
@@ -65,52 +74,117 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
         my $vmid = $param->{vmid};
-
-        PVE::QemuConfig->load_config($vmid); # VM exists on this node?
-        my $pid = PVE::QemuServer::check_running($vmid)
-            or die "VM $vmid is not running\n";
-        my $cmdline = PVE::Tools::file_get_contents("/proc/$pid/cmdline");
-        die "VM $vmid was started before the H.264 console was installed (no "
-            . "'-display dbus'). Shut it down and start it again to enable it.\n"
-            if $cmdline !~ m/dbus,p2p=yes/;
-
+        my $node = $param->{node};
         my $authpath = "/vms/$vmid";
-        my $ticket = PVE::AccessControl::assemble_vnc_ticket($authuser, $authpath);
+        my $ctl = '/usr/local/sbin/pve-h264-ctl';
 
+        my $remote = $node ne 'localhost' && $node ne PVE::INotify::nodename();
+        PVE::QemuConfig->load_config($vmid, $remote ? $node : undef); # VM on that node?
+
+        # cluster SSH, as vncproxy uses for remote VMs; only the vmid goes into
+        # the remote command line (ssh hands it to a shell)
+        my $ssh = $remote
+            ? PVE::SSHInfo::ssh_info_to_command(PVE::SSHInfo::get_ssh_info($node), '-T')
+            : [];
+        my $missing = "pve-h264-console is not installed (or is too old) on node '$node'. "
+            . "Install the same version on every cluster node.\n";
+
+        die $missing if !$remote && !-x $ctl;
+
+        my ($token, $err) = ('', '');
+        my $rc = eval {
+            PVE::Tools::run_command(
+                [@$ssh, $ctl, 'prepare', $vmid, $remote ? () : ($authuser)],
+                timeout => 45,
+                noerr => 1,
+                outfunc => sub { $token .= shift },
+                errfunc => sub { $err .= shift . "\n" },
+            );
+        };
+        die($@ || "pve-h264-ctl was terminated\n") if !defined($rc);
+        die $missing if $remote && $rc == 127; # remote shell: command not found
+        die($err || "pve-h264-ctl failed (exit code $rc)\n") if $rc != 0;
+        die "pve-h264-ctl returned no token\n" if $token !~ m/^([0-9a-f]{64})$/;
+        $token = $1;
+
+        if (!$remote) {
+            my $ticket = PVE::AccessControl::assemble_vnc_ticket($authuser, $authpath);
+            return { user => $authuser, ticket => $ticket, token => $token };
+        }
+
+        # VM on another node: a one-shot relay socket here, for this node's
+        # pveproxy, piped to the daemon's socket on $node over SSH
         open(my $rnd, '<', '/dev/urandom') or die "urandom: $!\n";
-        sysread($rnd, my $raw, 32) == 32 or die "urandom short read\n";
+        sysread($rnd, my $raw, 16) == 16 or die "urandom short read\n";
         close($rnd);
-        my $token = unpack('H*', $raw);
+        my ($relay) = unpack('H*', $raw) =~ m/^([0-9a-f]{32})$/; # untaint
 
-        my $dir = "/run/pve-h264/tokens/$vmid";
+        my $gid = getgrnam('www-data') // die "no www-data group\n";
+        my $dir = '/run/pve-h264/relay';
         require File::Path;
         File::Path::make_path($dir, { mode => 0700 });
         chmod(0711, '/run/pve-h264');
-        chmod(0700, '/run/pve-h264/tokens');
-        if (opendir(my $dh, $dir)) { # expire stale tokens
-            for my $f (readdir($dh)) {
-                next if $f !~ m/^([0-9a-f]+)$/;
-                my $p = "$dir/$1";
-                my $mtime = (stat($p))[9] // 0;
-                unlink($p) if time() - $mtime > 120;
-            }
-            closedir($dh);
-        }
-        PVE::Tools::file_set_contents("$dir/$token", "$authuser\n", 0600);
+        chown(0, $gid, $dir) or die "chown $dir: $!\n";
+        chmod(0710, $dir) or die "chmod $dir: $!\n";
+        my $path = "$dir/$relay.sock";
 
-        eval {
-            PVE::Tools::run_command(
-                ['/bin/systemctl', 'start', "pve-h264d\@$vmid.service"],
-                timeout => 30,
+        my $sock;
+        {
+            my $old = umask(0177); # socket created 0600, opened up to www-data below
+            $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 1);
+            umask($old);
+        }
+        die "failed to create relay socket: $!\n" if !$sock;
+        if (!chown(0, $gid, $path) || !chmod(0660, $path)) {
+            my $e = $!;
+            unlink($path);
+            die "relay socket permissions: $e\n";
+        }
+
+        my $realcmd = sub {
+            my $upid = shift;
+            syslog('info', "starting H.264 console relay to node '$node' $upid\n");
+            my $cli;
+            eval {
+                alarm(0);
+                local $SIG{ALRM} = sub { die "connection timed out\n" };
+                alarm(10);
+                $cli = $sock->accept();
+                alarm(0);
+            };
+            my $aerr = $@;
+            unlink($path);
+            close($sock);
+            die $aerr if $aerr;
+            die "relay connection failed: $!\n" if !$cli;
+            my $rrc = run_command(
+                [@$ssh, '/usr/bin/socat', '-', "UNIX-CONNECT:/run/pve-h264/$vmid.sock"],
+                output => '>&' . fileno($cli),
+                input => '<&' . fileno($cli),
+                noerr => 1,
             );
+            # undef: ssh ended by a signal (uninstall, task stop)
+            die "H.264 console relay to node '$node' failed (exit code $rrc)\n"
+                if defined($rrc) && $rrc != 0;
+            return;
         };
-        if (my $err = $@) {
-            unlink("$dir/$token");
-            die "failed to start H.264 console daemon ($err) - see "
-                . "'journalctl -u pve-h264d\@$vmid'\n";
+
+        my $upid = eval { $rpcenv->fork_worker('h264relay', $vmid, $authuser, $realcmd, 1) };
+        my $ferr = $@;
+        close($sock); # the worker has its own copy
+        if ($ferr) {
+            unlink($path);
+            die $ferr;
         }
 
-        return { user => $authuser, ticket => $ticket, token => $token };
+        my $ticket = PVE::AccessControl::assemble_vnc_ticket($authuser, $authpath, $relay);
+        return {
+            user => $authuser,
+            ticket => $ticket,
+            token => $token,
+            relay => $relay,
+            upid => $upid,
+        };
     },
 });
 
@@ -133,6 +207,12 @@ __PACKAGE__->register_method({
                 type => 'string',
                 maxLength => 512,
             },
+            relay => {
+                description => "Relay id from a previous h264proxy call (VM on another node).",
+                type => 'string',
+                pattern => '[0-9a-f]{32}',
+                optional => 1,
+            },
         },
     },
     returns => {
@@ -148,10 +228,17 @@ __PACKAGE__->register_method({
         my $authuser = $rpcenv->get_user();
         my $vmid = $param->{vmid};
 
-        PVE::AccessControl::verify_vnc_ticket($param->{vncticket}, $authuser, "/vms/$vmid");
+        # a relay ticket is bound to its relay id; a local one has none, so
+        # neither can be used for the other
+        my $relay = $param->{relay};
+        PVE::AccessControl::verify_vnc_ticket($param->{vncticket}, $authuser, "/vms/$vmid", $relay);
 
         # the stream itself is additionally protected by the one-time token
         # that the client sends as first message (checked by pve-h264d)
+        if (defined($relay)) {
+            $relay =~ m/^([0-9a-f]{32})$/ or die "invalid relay id\n";
+            return { socket => "/run/pve-h264/relay/$1.sock" };
+        }
         return { socket => "/run/pve-h264/$vmid.sock" };
     },
 });

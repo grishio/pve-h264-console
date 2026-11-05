@@ -26,7 +26,10 @@ install -d -m 0755 /etc/pve-h264
 [ -e /etc/pve-h264/h264d.conf ] || install -m 0644 h264d.conf /etc/pve-h264/h264d.conf
 systemctl daemon-reload
 
-echo ">> installing patcher + apt hook"
+echo ">> installing helper, patcher + apt hook"
+# the patched API calls the helper (locally, and over SSH from other cluster
+# nodes), so it goes in before the patch is applied
+install -m 0755 helper/pve-h264-ctl /usr/local/sbin/pve-h264-ctl
 install -m 0755 patches/pve-h264-patch /usr/local/sbin/pve-h264-patch
 cat > /etc/apt/apt.conf.d/99pve-h264-console <<'HOOK'
 // re-apply pve-h264-console integration after Proxmox package upgrades

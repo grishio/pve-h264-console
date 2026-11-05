@@ -49,8 +49,8 @@ start with the [README](README.md).
 
 ```
 Browser  ── viewer page /?console=kvm&h264=1&vmid=V&node=N  (served by pveproxy)
-   │  1. POST /api2/json/nodes/N/qemu/V/h264proxy        → {ticket, token}   (pvedaemon, root)
-   │  2. wss  /api2/json/nodes/N/qemu/V/h264websocket?vncticket=…            (pveproxy)
+   │  1. POST /api2/json/nodes/N/qemu/V/h264proxy        → {ticket, token[, relay]}  (pvedaemon, root)
+   │  2. wss  /api2/json/nodes/N/qemu/V/h264websocket?vncticket=…[&relay=…]        (pveproxy)
    │  3. first message: one-time token
    ▼
 pveproxy (TLS, PVE auth + VNC-ticket check, TCP_NODELAY) ── unix socket /run/pve-h264/V.sock
@@ -68,6 +68,36 @@ pve-h264d@V.service   (one daemon per VM, root, started on demand, exits 30 s af
 QEMU  (-display dbus,p2p=yes[,audiodev=X] + -audiodev dbus,id=X added by the
        patched qemu-server, alongside the normal -vnc)
 ```
+
+### VMs on another cluster node
+
+Both API calls run on the node the browser is connected to (A), because A's
+pveproxy serves the websocket and pveproxy can't forward a websocket upgrade to
+another node. For a VM on node B, `h264proxy` does what stock noVNC's `vncproxy`
+does for a remote VM and goes over the cluster's SSH:
+
+```
+Browser ── wss (A's pveproxy) ── /run/pve-h264/relay/<id>.sock ── h264relay task on A
+             ssh root@B (cluster keys) ── socat ── /run/pve-h264/V.sock on B ── pve-h264d@V on B
+```
+
+1. On A: check that V's config is under `/etc/pve/nodes/B/`, then run
+   `ssh root@B pve-h264-ctl prepare V`. On B the helper checks the VM runs with the
+   D-Bus display, writes a one-time token, starts `pve-h264d@V` and prints the token.
+   Only the vmid goes into the remote command line.
+2. On A: create a one-shot unix socket `/run/pve-h264/relay/<id>.sock` (random id,
+   `root:www-data 0660`) and a task worker (`h264relay`, shown in the task log) that
+   accepts one connection within 10 s, unlinks the socket and pipes it to
+   `ssh root@B socat - UNIX-CONNECT:/run/pve-h264/V.sock`. socat is a qemu-server
+   dependency, so every node has it. The task ends with the stream.
+3. The returned VNC ticket is bound to the relay id. `h264websocket` with `relay=<id>`
+   relays to that socket, and B's daemon checks the token as usual.
+
+On the same host the relay added about 0.5–1 ms of round trip (SSH encryption, socat),
+plus about 0.2 s once per connection for the SSH handshake. Both ssh ends set
+`TCP_NODELAY`. For a local VM nothing changes: no SSH, no relay, and the same ticket
+and socket as before. Every node needs pve-h264-console installed, at the same
+version. If B has none (or an old one), A reports that instead of failing obscurely.
 
 ### Why these choices
 * **D-Bus display instead of patching QEMU**: available in stock pve-qemu,
@@ -324,6 +354,7 @@ QEMU  (-display dbus,p2p=yes[,audiodev=X] + -audiodev dbus,id=X added by the
 | `www/keymap.js` | `KeyboardEvent.code` → QEMU qnum table, key combos |
 | `www/h264.css` | viewer styles |
 | `patches/pve-h264-patch` | idempotent patcher for the PVE files (apply/revert/status) |
+| `helper/pve-h264-ctl` | node-local helper (root): `prepare <vmid>` checks the VM, creates a one-time token, starts the daemon. Called by `h264proxy`, over SSH for VMs on other nodes |
 | `systemd/pve-h264d@.service` | per-VM unit (Type=notify, on demand) |
 | `h264d.conf` | default config (installed to `/etc/pve-h264/h264d.conf` if absent) |
 | `install.sh` / `uninstall.sh` | install/update, and full removal |
@@ -334,18 +365,19 @@ QEMU  (-display dbus,p2p=yes[,audiodev=X] + -audiodev dbus,id=X added by the
 |---|---|
 | `/usr/local/sbin/pve-h264d` | daemon binary |
 | `/usr/local/sbin/pve-h264-patch` | patcher |
+| `/usr/local/sbin/pve-h264-ctl` | helper called by `h264proxy` (locally and over cluster SSH) |
 | `/usr/share/pve-h264-console/` | viewer files, served by pveproxy at `/h264/` |
 | `/usr/share/doc/pve-h264-console/documentation.md` | this document (linked from the systemd unit) |
 | `/etc/systemd/system/pve-h264d@.service` | unit |
 | `/etc/pve-h264/h264d.conf` | configuration (kept on reinstall) |
 | `/etc/apt/apt.conf.d/99pve-h264-console` | re-applies the patches after every dpkg run |
-| `/run/pve-h264/` | `V.sock` (root:www-data 0660), `V.lock`, `tokens/V/<token>` (root 0700) |
+| `/run/pve-h264/` | `V.sock` (root:www-data 0660), `V.lock`, `tokens/V/<token>` (root 0700), `relay/<id>.sock` (dir root:www-data 0710, socket 0660; one-shot, VMs on other nodes) |
 
 ### Proxmox files patched (all pure insertions between `pve-h264-console BEGIN/END` markers)
 | File | Change |
 |---|---|
 | `/usr/share/perl5/PVE/QemuServer.pm` | add `-display dbus,p2p=yes` after `-vnc`; `audio0` with the (default) `spice` driver: `-audiodev spice,…` → `dbus,…,out.frequency=48000,out.channels=2` plus `audiodev=` on the display (not with `audio = 0` in `h264d.conf`); spice agent port chardev `spicevmc` → `dbus` (all skipped for `virtio-gl` or user `args` containing `-display`) |
-| `/usr/share/perl5/PVE/API2/Qemu.pm` | new API methods `h264proxy` (POST, VM.Console) and `h264websocket` (GET) |
+| `/usr/share/perl5/PVE/API2/Qemu.pm` | new API methods `h264proxy` (POST, VM.Console; runs on the browser's node, relays VMs on other nodes over cluster SSH) and `h264websocket` (GET) |
 | `/usr/share/perl5/PVE/Service/pveproxy.pm` | serve `/h264/`; render viewer for `?console=kvm&h264=1`; append `-h264.<mtime>` to the UI script's `?ver=` cache-busting tag |
 | `/usr/share/perl5/PVE/APIServer/AnyEvent.pm` | `TCP_NODELAY` on websocket proxy legs |
 | `/usr/share/pve-manager/js/pvemanagerlib.js` | Console menu entry "H.264", `openH264Viewer`, default-viewer + Console-tab switch |
@@ -651,6 +683,14 @@ Opening a stream takes three checks:
 pveproxy checks the login and ticket before relaying anything. Tokens expire after
 60 seconds and are deleted when used. No network ports are opened.
 
+For a VM on another cluster node (§3), the browser's node reaches the VM's node over
+the cluster's root SSH, as noVNC does for remote VMs. Only the numeric vmid is put into
+the remote command. The node must be a cluster member, and the VM's config must be on
+it. The relay socket has a random name, only www-data (pveproxy) can open it, it takes
+exactly one connection within 10 s, and it is unlinked when that connection arrives. The
+ticket is bound to the relay id, so a relay ticket only opens that relay and a local
+ticket opens no relay. The VM's node still checks the one-time token.
+
 ## 10. Performance and test results
 
 ### Performance summary
@@ -683,6 +723,8 @@ systemctl unset-environment PVE_H264D_TEST
 ```bash
 # full path: login → h264proxy → wss through pveproxy → frames
 PVE_USER=root@pam PVE_PASS=... python3 tools/h264-e2e.py <vmid> 5
+# cluster: VM on another node, through this node's relay (prints relay=…)
+PVE_NODE=<vm's node> PVE_USER=root@pam PVE_PASS=... python3 tools/h264-e2e.py <vmid> 5
 ```
 
 ```bash
@@ -770,8 +812,8 @@ audio device.
 * **std VGA ≈33 fps** cap (QEMU 30 ms timer). Fix options: use `vga: virtio`;
   or rebuild pve-qemu with a patch setting `ddl->dcl.update_interval = 16`
   (ms) in `ui/dbus-listener.c:dbus_display_listener_new()`.
-* **Cluster**: `h264proxy` is `proxyto => node`, but the websocket is served
-  by the pveproxy you're connected to; open the PVE UI on the VM's node.
+* **Cluster**: VMs on other nodes are relayed over the cluster's SSH (§3), which adds
+  a little latency and SSH CPU time on both nodes. Install the same version on every node.
 * `virtio-gl` (VirGL) VMs are skipped (they already use `-display egl-headless`).
 * VA-API path written per FFmpeg API but untested on real Intel/AMD hardware.
 * Clipboard: browsers only give a page the clipboard on a paste, so the browser's
@@ -806,7 +848,9 @@ offset.
 | Symptom | Check |
 |---|---|
 | "started before the H.264 console was installed" | full stop + start of the VM; `qm showcmd <vmid> \| grep -o -- '-display [^ ]*'` |
-| No "H.264" menu entry | `pve-h264-patch status` (all `[x]`?); in the browser console `typeof PVE.Utils.openH264Viewer` should be `"function"` — if not, the browser runs a cached UI (hard-refresh; fixed for installs that include the cache-tag patch) or the page comes from another cluster node |
+| No "H.264" menu entry | `pve-h264-patch status` (all `[x]`?); in the browser console `typeof PVE.Utils.openH264Viewer` should be `"function"` — if not, the browser runs a cached UI (hard-refresh; fixed for installs that include the cache-tag patch) or the page comes from another cluster node without pve-h264-console |
+| "not installed (or is too old) on node 'X'" | the VM runs on node X, which has no `/usr/local/sbin/pve-h264-ctl`: run `./install.sh` on X (same version on every node) |
+| VM on another node: connects, then closes at once | task log of the `h264relay` task on the node you're connected to (`ssh`/`socat` errors); on the VM's node `journalctl -u pve-h264d@<vmid>`; check `ssh root@<node>` works from the node you're connected to (`pvecm updatecerts` repairs cluster SSH keys) |
 | "failed to start H.264 console daemon" | `journalctl -u pve-h264d@<vmid>` |
 | Clipboard unavailable / not working | the panel (📋 Clipboard) shows the reason; `journalctl -u pve-h264d@<vmid> \| grep -i "clipboard\|vdagent"`. "no spice agent port" = `vga` isn't virtio/qxl, or the VM was started before the install (stop + start); "not running" = start the spice agent in the guest (Windows: *spice-agent* service from the virtio-win guest tools; Linux: `spice-vdagent`, needs an X11/XWayland session for the clipboard). Pasting does nothing: the browser must allow clipboard access for the PVE page; the panel's box always works (paste into it, *Send to guest*) |
 | Windows guest doesn't resize | `journalctl -u pve-h264d@<vmid> \| grep -i "resize\|vdagent"`: `guest-exec resize:` lines give the reason (agent not responding, nobody logged in, Win32 error from SetDisplayConfig); for the spice agent path: "not on D-Bus" = VM started before the update (stop + start); no "guest agent connected" = `spice-agent` service not running in the guest; guest log `No suitable mode found` = the driver doesn't list that size (hint not applied yet, or larger than its framebuffer) |
@@ -968,3 +1012,13 @@ offset.
   queued (were limited to a 64-byte payload), viewer messages larger than
   64 KiB are split into several websocket frames (pveproxy's 128 KiB frame
   limit), and the daemon accepts client messages up to 1 MiB + 64.
+* 2026-11-05 — **Cluster support**: opening the console of a VM on another node
+  no longer needs the PVE UI opened on that node. `h264proxy` no longer uses
+  `proxyto` and runs on the browser's node, and VMs on other nodes are relayed over
+  the cluster's SSH like noVNC's (`pve-h264-ctl prepare` on the VM's node + a one-shot
+  `h264relay` task, ticket bound to the relay id). The token/daemon start logic moved
+  from the API patch into `pve-h264-ctl`, and local VMs behave as before. Tested on a
+  single node by forcing the relay path over an SSH loopback: e2e stream, headless
+  Chromium viewer, ticket binding (wrong or missing relay → 401, bad syntax → 400, used
+  socket can't be reopened), socket permissions, 10 s accept timeout, relay cleanup.
+  `tools/h264-e2e.py` takes `PVE_NODE`, and both test tools take `PVE_TICKET`.

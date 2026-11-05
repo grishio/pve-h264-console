@@ -35,8 +35,14 @@ else
     echo "   patcher not installed - nothing to revert (files are checked below)"
 fi
 
+echo ">> stopping relays to other cluster nodes"
+# h264relay tasks run 'ssh ... socat - UNIX-CONNECT:/run/pve-h264/<vmid>.sock';
+# ending ssh ends the task and closes that viewer's websocket
+pkill -f -- '/usr/bin/socat - UNIX-CONNECT:/run/pve-h264/' || true
+
 echo ">> removing installed files"
 rm -f /etc/apt/apt.conf.d/99pve-h264-console /usr/local/sbin/pve-h264-patch \
+      /usr/local/sbin/pve-h264-ctl \
       /usr/local/sbin/pve-h264d /etc/systemd/system/pve-h264d@.service
 rm -rf /usr/share/pve-h264-console /usr/share/doc/pve-h264-console /run/pve-h264
 systemctl daemon-reload

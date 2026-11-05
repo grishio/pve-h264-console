@@ -1,0 +1,109 @@
+#!/usr/bin/perl -T
+# SPDX-License-Identifier: MIT
+# pve-h264-ctl - node-local helper of the PVE H.264 console (root only).
+#
+# usage: pve-h264-ctl prepare <vmid> [<user>]
+#
+#   Checks that VM <vmid> runs on THIS node with the H.264 display, creates a
+#   one-time stream token, starts pve-h264d@<vmid> and prints the token.
+#
+#   Called by the h264proxy API on the node the viewer is connected to: run
+#   directly for a local VM, and over the cluster's SSH (like stock noVNC's
+#   'qm vncproxy') for a VM on another node. Over SSH only the vmid is passed,
+#   never anything a user controls. <user> is only written into the token file
+#   for reference; pve-h264d checks the token's existence, not its contents.
+use strict;
+use warnings;
+
+use File::Path ();
+use PVE::INotify;
+use PVE::QemuServer::Helpers;
+use PVE::Tools;
+
+$ENV{PATH} = '/usr/sbin:/usr/bin:/sbin:/bin';
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+my $RUN = '/run/pve-h264';
+my $TOKEN_MAX_AGE = 120; # s; pve-h264d itself accepts a token for 60 s
+
+sub usage {
+    print STDERR "usage: pve-h264-ctl prepare <vmid> [<user>]\n";
+    exit 2;
+}
+
+sub new_token {
+    open(my $rnd, '<', '/dev/urandom') or die "urandom: $!\n";
+    sysread($rnd, my $raw, 32) == 32 or die "urandom short read\n";
+    close($rnd);
+    return unpack('H*', $raw);
+}
+
+sub prepare {
+    my ($vmid, $user) = @_;
+
+    my $nodename = PVE::INotify::nodename();
+    die "VM $vmid does not exist on node '$nodename'\n"
+        if !-f "/etc/pve/nodes/$nodename/qemu-server/$vmid.conf";
+
+    my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid)
+        or die "VM $vmid is not running\n";
+    $pid = $1 if $pid =~ m/^(\d+)$/; # untaint
+    my $cmdline = PVE::Tools::file_get_contents("/proc/$pid/cmdline");
+    die "VM $vmid was started before the H.264 console was installed (no "
+        . "'-display dbus'). Shut it down and start it again to enable it.\n"
+        if $cmdline !~ m/dbus,p2p=yes/;
+
+    my $token = new_token();
+    my $dir = "$RUN/tokens/$vmid";
+    File::Path::make_path($dir, { mode => 0700 });
+    chmod(0711, $RUN);
+    chmod(0700, "$RUN/tokens");
+    if (opendir(my $dh, $dir)) { # expire stale tokens
+        for my $f (readdir($dh)) {
+            next if $f !~ m/^([0-9a-f]+)$/;
+            my $p = "$dir/$1";
+            my $mtime = (stat($p))[9] // 0;
+            unlink($p) if time() - $mtime > $TOKEN_MAX_AGE;
+        }
+        closedir($dh);
+    }
+    PVE::Tools::file_set_contents("$dir/$token", ($user // 'remote') . "\n", 0600);
+
+    eval {
+        PVE::Tools::run_command(
+            ['/bin/systemctl', 'start', "pve-h264d\@$vmid.service"],
+            timeout => 30,
+        );
+    };
+    if (my $err = $@) {
+        unlink("$dir/$token");
+        chomp($err);
+        die "failed to start H.264 console daemon ($err) - see "
+            . "'journalctl -u pve-h264d\@$vmid' on node '$nodename'\n";
+    }
+
+    print "$token\n";
+}
+
+die "pve-h264-ctl: must be run as root\n" if $> != 0;
+
+my $cmd = shift(@ARGV) // usage();
+if ($cmd eq 'prepare') {
+    my $vmid = shift(@ARGV) // usage();
+    $vmid =~ m/^([1-9][0-9]{2,8})$/ or die "invalid vmid '$vmid'\n";
+    $vmid = $1;
+    my $user = shift(@ARGV);
+    if (defined($user)) {
+        # PVE userid syntax (pve-userid format), also untaints it
+        $user =~ m/^([^\s:\/]+\@[A-Za-z][A-Za-z0-9.\-_]+)$/ or die "invalid user '$user'\n";
+        $user = $1;
+    }
+    usage() if @ARGV;
+    eval { prepare($vmid, $user) };
+    if (my $err = $@) {
+        print STDERR $err;
+        exit 1;
+    }
+    exit 0;
+}
+usage();

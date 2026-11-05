@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Usage: start chromium --headless=new --no-sandbox --ignore-certificate-errors
 #        --remote-debugging-port=9222 about:blank, then
-#        PVE_USER=.. PVE_PASS=.. OUT_DIR=/tmp h264-browser-test.py <vmid> view|esc|perf|ui|mouse|settings
+#        PVE_USER=.. PVE_PASS=.. (or PVE_TICKET=..) OUT_DIR=/tmp h264-browser-test.py <vmid> view|esc|perf|ui|mouse|settings
 # Minimal CDP driver: open the H.264 viewer in headless Chromium as the test user.
 import json, os, socket, struct, sys, time, base64, ssl, urllib.request, urllib.parse
 S = os.environ.get("OUT_DIR", "/tmp"); vmid = sys.argv[1]; action = sys.argv[2] if len(sys.argv) > 2 else "view"
 host = socket.gethostname()
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-pw = os.environ["PVE_PASS"]
-r = urllib.request.Request("https://127.0.0.1:8006/api2/json/access/ticket", method="POST",
-    data=urllib.parse.urlencode({"username": os.environ.get("PVE_USER", "root@pam"), "password": pw}).encode())
-ticket = json.load(urllib.request.urlopen(r, context=ctx))["data"]["ticket"]
+ticket = os.environ.get("PVE_TICKET")  # or log in with PVE_USER / PVE_PASS
+if not ticket:
+    r = urllib.request.Request("https://127.0.0.1:8006/api2/json/access/ticket", method="POST",
+        data=urllib.parse.urlencode({"username": os.environ.get("PVE_USER", "root@pam"), "password": os.environ["PVE_PASS"]}).encode())
+    ticket = json.load(urllib.request.urlopen(r, context=ctx))["data"]["ticket"]
 tabs = json.load(urllib.request.urlopen("http://127.0.0.1:9222/json"))
 page = next(t for t in tabs if t["type"] == "page")
 u = urllib.parse.urlparse(page["webSocketDebuggerUrl"])

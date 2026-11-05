@@ -316,7 +316,9 @@ async function connect() {
         return;
     }
     if (ws) return;
-    const url = `wss://${location.host}/api2/json/nodes/${node}/qemu/${vmid}/h264websocket?vncticket=${encodeURIComponent(info.ticket)}`;
+    // relay: the VM runs on another cluster node; this node relays the stream
+    const relay = info.relay ? `&relay=${encodeURIComponent(info.relay)}` : '';
+    const url = `wss://${location.host}/api2/json/nodes/${node}/qemu/${vmid}/h264websocket?vncticket=${encodeURIComponent(info.ticket)}${relay}`;
     ws = new WebSocket(url, ['binary']);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => sendStr(C.AUTH, info.token);
