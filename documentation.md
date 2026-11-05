@@ -526,6 +526,11 @@ pve-h264-patch status # verify
 
 ### Updates
 
+* **Updating pve-h264-console itself:** `git pull` in the repository and run `./install.sh`
+  again. It rebuilds and replaces the daemon and viewer and updates the patches in place;
+  `/etc/pve-h264/h264d.conf` is kept. Open viewers pick up the new version on reload. A
+  change to QEMU's command line (e.g. the audio timer in the 2026-11-05 audio fix) reaches
+  a VM only after a full stop + start.
 * **Proxmox updates** to `qemu-server`, `pve-manager` or `libpve-http-server-perl` replace
   the patched files. The apt hook `/etc/apt/apt.conf.d/99pve-h264-console` re-applies the
   patches automatically.

@@ -64,6 +64,22 @@ guest isn't enough, because QEMU's command line has to change.
 **4. Open the console:** **VM → Console ▾ → H.264**. Click **Default** in the viewer's
 toolbar if you want it to be your usual console.
 
+**Updating to the latest version:** pull the repository and run the installer again. It
+replaces the daemon and viewer and re-applies the Proxmox patches; your settings in
+`/etc/pve-h264/h264d.conf` are kept.
+
+```bash
+cd pve-h264-console && git pull
+```
+
+```bash
+./install.sh
+```
+
+Then reload the Proxmox web UI. Some fixes change QEMU's command line and only reach a VM
+after it is fully stopped and started again. The [change log](documentation.md#13-change-log)
+says when.
+
 To check that everything is hooked in:
 
 ```bash
