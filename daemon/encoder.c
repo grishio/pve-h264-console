@@ -329,7 +329,11 @@ static void drm_driver(const char *dev, char *out, size_t outlen)
     }
     target[n] = 0;
     const char *b = strrchr(target, '/');
-    snprintf(out, outlen, "%s", b ? b + 1 : target);
+    b = b ? b + 1 : target;
+    if (strlen(b) < outlen)
+        memcpy(out, b, strlen(b) + 1);
+    else
+        snprintf(out, outlen, "?");
 }
 
 static void errcat(char *err, size_t errlen, const char *fmt, ...)

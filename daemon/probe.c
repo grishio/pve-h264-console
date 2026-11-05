@@ -7,6 +7,7 @@
 #include "pve-h264d.h"
 
 #include <dirent.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -27,8 +28,10 @@ static void list_dri(void)
     while ((de = readdir(dir))) {
         if (strncmp(de->d_name, "renderD", 7))
             continue;
-        char link[256], target[256] = "?", vendor[64] = "?";
-        snprintf(link, sizeof(link), "/sys/class/drm/%s/device/driver", de->d_name);
+        char link[PATH_MAX], target[256] = "?", vendor[64] = "?";
+        int ll = snprintf(link, sizeof(link), "/sys/class/drm/%s/device/driver", de->d_name);
+        if (ll < 0 || (size_t)ll >= sizeof(link))
+            continue;
         ssize_t l = readlink(link, target, sizeof(target) - 1);
         if (l > 0)
             target[l] = 0;

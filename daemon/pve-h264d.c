@@ -122,7 +122,11 @@ static void load_config(void)
         char k[64], v[128];
         if (line[0] == '#' || sscanf(line, " %63[^= ] = %127s", k, v) != 2)
             continue;
-#define S(name) if (!strcmp(k, #name)) { snprintf(cfg.name, sizeof(cfg.name), "%s", v); continue; }
+/* overlong values are rejected (default kept) rather than silently truncated */
+#define S(name) if (!strcmp(k, #name)) { \
+            if (strlen(v) < sizeof(cfg.name)) memcpy(cfg.name, v, strlen(v) + 1); \
+            else LOG("config: value for '%s' too long (max %zu), ignored", k, sizeof(cfg.name) - 1); \
+            continue; }
 #define I(name) if (!strcmp(k, #name)) { cfg.name = atoi(v); continue; }
         S(backend) S(nvenc_preset) S(vaapi_device) S(rc) S(tune) S(multipass)
         S(clipboard)
@@ -195,7 +199,7 @@ static GMainLoop *g_loop;
 static GDBusConnection *g_qemu;    /* main p2p display connection */
 static GDBusConnection *g_lconn;   /* listener connection (QEMU -> us) */
 static atomic_bool g_quit;
-static char g_sock_path[128];
+static char g_sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 /* framebuffer state, protected by fb_lock */
 static pthread_mutex_t fb_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1809,7 +1813,9 @@ static void config_apply_json(const char *js)
     }
 #define JI(key, field) if (json_int(js, key, &v)) cfg.field = v;
 /* invalid choices are ignored (the current value stays) */
-#define JS(key, field, opts) if (json_str(js, key, sv, sizeof(sv)) && one_of(sv, opts)) snprintf(cfg.field, sizeof(cfg.field), "%s", sv);
+#define JS(key, field, opts) \
+    if (json_str(js, key, sv, sizeof(sv)) && one_of(sv, opts) && strlen(sv) < sizeof(cfg.field)) \
+        memcpy(cfg.field, sv, strlen(sv) + 1);
     JI("max_kbps", max_kbps) JI("min_kbps", min_kbps) JI("fps", fps)
     JI("quality", quality) JI("vbv_frames", vbv_frames) JI("max_inflight", max_inflight)
     JI("refine_frames", refine_frames) JI("spatial_aq", spatial_aq)
@@ -2228,16 +2234,26 @@ static int listen_socket(int vmid)
 {
     mkdir(RUN_DIR, 0711);
     chmod(RUN_DIR, 0711);
-    snprintf(g_sock_path, sizeof(g_sock_path), RUN_DIR "/%d.sock", vmid);
+    int pl = snprintf(g_sock_path, sizeof(g_sock_path), RUN_DIR "/%d.sock", vmid);
+    if (pl < 0 || (size_t)pl >= sizeof(g_sock_path)) {
+        LOG("socket path too long");
+        g_sock_path[0] = 0;
+        return -1;
+    }
     unlink(g_sock_path);
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        LOG("socket: %s", strerror(errno));
+        return -1;
+    }
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", g_sock_path);
+    memcpy(sa.sun_path, g_sock_path, (size_t)pl + 1);
     mode_t old = umask(0177);
     int r = bind(fd, (struct sockaddr *)&sa, sizeof(sa));
     umask(old);
     if (r < 0 || listen(fd, 16) < 0) {
         LOG("bind %s: %s", g_sock_path, strerror(errno));
+        close(fd);
         return -1;
     }
     /* pveproxy runs as www-data */
