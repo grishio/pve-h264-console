@@ -181,6 +181,30 @@ static bool voice_init(Voice *v)
 static int16_t fifo[FIFO_FRAMES * AUDIO_CHANNELS];
 static int fifo_n;        /* frames in fifo */
 static int64_t fifo_ts;   /* host time of fifo[0] */
+static bool fifo_restart = true; /* next Write starts a new stream: anchor fifo_ts */
+static int64_t last_lag;  /* previous Write: arrival - its samples' time */
+static int64_t hold_lag;  /* a late Write waits in the fifo: how late it was */
+static GSource *hold_timer; /* ... until the next Write, or this fires */
+#define LATE_US 20000     /* later than this: a stall or a gap (timer jitter is ~10 ms) */
+#define CATCHUP_US 2000   /* the next Write this much less late: a stall catching up */
+#define HOLD_MS 25        /* no Write within this: the late one starts after a gap */
+#define GAP_US 1000000    /* off by more than this: re-anchor at once */
+
+static void hold_end(void)
+{
+    if (hold_timer) {
+        g_source_destroy(hold_timer);
+        g_source_unref(hold_timer);
+        hold_timer = NULL;
+    }
+}
+
+static void fifo_reset(void)
+{
+    hold_end();
+    fifo_n = 0;
+    fifo_restart = true;
+}
 static uint32_t g_seq;
 static AVCodecContext *g_opus;
 static AVFrame *g_oframe;
@@ -278,17 +302,8 @@ static void emit(const int16_t *pcm, int64_t ts)
     }
 }
 
-/* Converted samples [fifo_n, fifo_n + n) arrived at host time t. */
-static void fifo_commit(int n, int64_t t)
+static void fifo_emit(void)
 {
-    int64_t end = fifo_ts + (int64_t)fifo_n * 1000000 / AUDIO_RATE;
-    if (fifo_n == 0 && llabs(t - end) > 20000)
-        fifo_ts = t; /* (re)start of a stream */
-    else if (llabs(t - end) > 20000)
-        fifo_ts += t - end; /* jumped (guest stall, host load): re-anchor */
-    else
-        fifo_ts += (t - end) / 16; /* follow the arrival times, smoothly */
-    fifo_n += n;
     int done = 0;
     while (fifo_n - done >= AUDIO_FRAME) {
         emit(fifo + (size_t)done * AUDIO_CHANNELS, fifo_ts);
@@ -302,12 +317,66 @@ static void fifo_commit(int n, int64_t t)
     }
 }
 
+/* nothing followed the late Write: its audio starts after a gap */
+static gboolean hold_expired(gpointer ud)
+{
+    g_source_unref(hold_timer);
+    hold_timer = NULL;
+    fifo_ts += hold_lag;
+    fifo_emit();
+    return G_SOURCE_REMOVE;
+}
+
+/* Converted samples [fifo_n, fifo_n + n) arrived at host time t.
+ *
+ * The timestamps are a sample clock: each packet's ts is the previous one +
+ * 10 ms, pulled gently (1/16 of the error per Write) towards the arrival
+ * times, which jitter by about one QEMU audio timer tick. A Write more than
+ * 20 ms late is either
+ *  - a stall: QEMU's main loop (or this thread) was held up, e.g. by a
+ *    CPU-bound x264 encode. No sample is missing and QEMU hands over the
+ *    backlog faster than real time (two timer ticks per 10 ms buffer), so the
+ *    next Write comes early. The timestamps stay continuous, so the viewer
+ *    sees late packets, which is what its jitter buffer is for; or
+ *  - a gap: the guest produced nothing for a while without stopping its
+ *    stream. Samples are missing, the next Write comes on time, and the clock
+ *    re-anchors at the arrival, so the viewer plays silence for the jump
+ *    (www/audio-worklet.js) instead of draining its buffer.
+ * The late Write's samples wait in the fifo until the next Write (5-10 ms)
+ * tells which it is, so a gap's audio carries its new time from the start. */
+static void fifo_commit(int n, int64_t t)
+{
+    int64_t end = fifo_ts + (int64_t)fifo_n * 1000000 / AUDIO_RATE;
+    int64_t lag = t - end;
+    if (fifo_restart || lag > GAP_US || lag < -GAP_US) {
+        hold_end();
+        fifo_ts += lag; /* new stream, long pause, or nonsense: re-anchor */
+        fifo_restart = false;
+    } else if (hold_timer) {
+        if (lag >= hold_lag - CATCHUP_US)
+            fifo_ts += lag; /* on time again after the late one: a gap */
+        hold_end();         /* else a stall catching up: stays continuous */
+    } else if (lag > LATE_US && !(last_lag > LATE_US && lag < last_lag - CATCHUP_US)) {
+        hold_lag = last_lag = lag; /* late (and not still catching up): wait and see */
+        fifo_n += n;
+        hold_timer = g_timeout_source_new(HOLD_MS);
+        g_source_set_callback(hold_timer, hold_expired, NULL, NULL);
+        g_source_attach(hold_timer, g_main_context_get_thread_default());
+        return;
+    } else if (lag <= LATE_US) {
+        fifo_ts += lag / 16; /* follow the arrival times, smoothly */
+    }
+    last_lag = lag;
+    fifo_n += n;
+    fifo_emit();
+}
+
 static void on_write(Voice *v, const uint8_t *data, size_t len, int64_t t)
 {
     if (!v->swr || !v->enabled)
         return;
     if (!audio_modes_wanted()) {
-        fifo_n = 0; /* nobody listening */
+        fifo_reset(); /* nobody listening */
         return;
     }
     /* Only one voice is forwarded (guests play through one stream at a
@@ -317,7 +386,7 @@ static void on_write(Voice *v, const uint8_t *data, size_t len, int64_t t)
             return;
         DBG("audio: forwarding voice %llx", (unsigned long long)v->id);
         g_active = v->id;
-        fifo_n = 0;
+        fifo_reset();
     }
     g_active_us = t;
 
@@ -346,7 +415,7 @@ static void on_write(Voice *v, const uint8_t *data, size_t len, int64_t t)
     int want = swr_get_out_samples(v->swr, n);
     if (want > room) {
         /* can't happen while frames are drained right away; be safe */
-        fifo_n = 0;
+        fifo_reset();
         room = FIFO_FRAMES;
     }
     uint8_t *out = (uint8_t *)(fifo + (size_t)fifo_n * AUDIO_CHANNELS);
@@ -457,7 +526,7 @@ static void listener_method(GDBusConnection *conn, const gchar *sender,
             DBG("audio: voice %llx %s", (unsigned long long)id, en ? "on" : "off");
             v->enabled = en;
             if (!en && g_active == id)
-                fifo_n = 0;
+                fifo_reset();
             update_playing();
         }
     } else if (!strcmp(method, "SetVolume")) {
@@ -504,24 +573,52 @@ static void on_closed(GDBusConnection *c, gboolean remote, GError *e, gpointer u
 
 /* ------------------------------------------------------------------ */
 /* test mode: 1 kHz beep in the first 100 ms of every second, the same  */
-/* moments the test pattern flashes (measures A/V sync end to end)      */
+/* moments the test pattern flashes (measures A/V sync end to end).     */
+/* PVE_H264D_TEST=...:gaps[=ms] leaves out that much audio at 2.5 s of  */
+/* every 3 s (a guest pausing without stopping its stream; default 300) */
+/* and :stalls[=ms] holds it back and then hands it over at once, like  */
+/* QEMU after its main loop was held up (default 80); :slow[=permille]  */
+/* delivers that much less than 48 kHz, like QEMU with a 10 ms audio    */
+/* timer period (default 24).                                           */
 /* ------------------------------------------------------------------ */
 static int64_t g_tone_start, g_tone_done;
+static int g_tone_gap_ms, g_tone_stall_ms, g_tone_slow;
+
+static int test_opt_ms(const char *test, const char *name, int def)
+{
+    const char *p = test ? strstr(test, name) : NULL;
+    if (!p)
+        return 0;
+    int v = def;
+    if (p[strlen(name)] == '=')
+        v = atoi(p + strlen(name) + 1);
+    return v > 0 && v <= 2000 ? v : def;
+}
 
 static gboolean tone_tick(gpointer ud)
 {
     Voice *v = ud;
     int64_t t = now_us();
-    int64_t due = (t - g_tone_start) * AUDIO_RATE / 1000000 - g_tone_done;
+    int64_t ph3 = t % 3000000 - 2500000;
+    if (g_tone_stall_ms && ph3 >= 0 && ph3 < g_tone_stall_ms * 1000LL)
+        return G_SOURCE_CONTINUE; /* held back: handed over afterwards */
+    int64_t rate = AUDIO_RATE * (1000 - g_tone_slow) / 1000; /* frames per host second */
+    int64_t due = (t - g_tone_start) * rate / 1000000 - g_tone_done;
     if (due < AUDIO_FRAME)
         return G_SOURCE_CONTINUE;
     due -= due % AUDIO_FRAME;
-    if (due > AUDIO_RATE / 4)
-        due = AUDIO_FRAME; /* we were stalled: don't produce a burst */
+    if (due > AUDIO_RATE / 4) {
+        g_tone_done += due - AUDIO_FRAME; /* we were stalled: drop it, no burst */
+        due = AUDIO_FRAME;
+    }
+    if (g_tone_gap_ms && ph3 >= 0 && ph3 < g_tone_gap_ms * 1000LL) {
+        g_tone_done += due; /* like a guest pausing its stream: no Write */
+        return G_SOURCE_CONTINUE;
+    }
     int16_t *buf = g_new(int16_t, (size_t)due * 2);
     for (int64_t i = 0; i < due; i++) {
-        /* samples start playing now: sample i sounds at t + i / rate */
-        int64_t ts = t + i * 1000000 / AUDIO_RATE;
+        /* the host time this sample is due (a backlog: in the past) */
+        int64_t ts = g_tone_start + (g_tone_done + i) * 1000000 / rate;
         double ph = 2 * M_PI * 1000.0 * (double)(ts % 1000000) / 1e6;
         int16_t s = av_test_flash(ts) ? (int16_t)(9000 * sin(ph)) : 0;
         buf[i * 2] = buf[i * 2 + 1] = s;
@@ -613,6 +710,12 @@ static void *audio_thread(void *ud)
                          .cur = {1.0f, 1.0f}};
     if (!g_conn_qemu) {
         voice_init(&tone);
+        const char *test = getenv("PVE_H264D_TEST");
+        g_tone_gap_ms = test_opt_ms(test, "gaps", 300);
+        g_tone_stall_ms = test_opt_ms(test, "stalls", 80);
+        g_tone_slow = test_opt_ms(test, "slow", 24);
+        if (g_tone_slow > 100)
+            g_tone_slow = 24;
         g_tone_start = now_us();
         GSource *s = g_timeout_source_new(5);
         g_source_set_callback(s, tone_tick, &tone, NULL);
@@ -624,7 +727,9 @@ static void *audio_thread(void *ud)
         st.src_channels = 2;
         pthread_mutex_unlock(&a_lock);
         audio_state_changed();
-        LOG("audio: TEST MODE: 1 kHz beep in the first 100 ms of every second");
+        LOG("audio: TEST MODE: 1 kHz beep in the first 100 ms of every second, "
+            "every 3 s a %d ms gap, a %d ms stall, %d permille slow", g_tone_gap_ms,
+            g_tone_stall_ms, g_tone_slow);
     } else if (!register_listener(loop)) {
         return NULL;
     }

@@ -296,6 +296,11 @@ PATCHES = [
     # D-Bus backend, handed to the D-Bus display, where pve-h264d picks it up
     # (daemon/audio.c). 'driver=none' is left alone; 'audio = 0' in
     # /etc/pve-h264/h264d.conf keeps audio on SPICE (remote-viewer) instead.
+    # timer-period=5000: QEMU mixes at most one 480-frame (10 ms) D-Bus buffer
+    # per audio timer tick, and the timer re-arms 10 ms after each run ends, so
+    # with the default 10 ms period the guest's sound came out ~2-3 % slow
+    # (46.8 kHz measured, worse under host CPU load). A 5 ms tick leaves room;
+    # QEMU's rate control still holds it to real time.
     ("qemu-server: add -display dbus,p2p=yes", QEMUSERVER, "after",
      "        push @$cmd, '-vnc', \"unix:$socket,password=on\";\n",
      "        if ($vga->{type} ne 'virtio-gl' && ($conf->{args} // '') !~ m/-display\\b/) {\n"
@@ -308,7 +313,7 @@ PATCHES = [
      "            for (my $i = 0; $h264_audio && $i < $#$devices; $i++) {\n"
      "                next if $devices->[$i] ne '-audiodev'\n"
      "                    || $devices->[$i + 1] !~ m/^spice,id=([\\w-]+)$/;\n"
-     "                $devices->[$i + 1] = \"dbus,id=$1,out.frequency=48000,out.channels=2\";\n"
+     "                $devices->[$i + 1] = \"dbus,id=$1,timer-period=5000,out.frequency=48000,out.channels=2\";\n"
      "                $display .= \",audiodev=$1\";\n"
      "                last;\n"
      "            }\n"

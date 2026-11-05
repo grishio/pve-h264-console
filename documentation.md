@@ -285,9 +285,43 @@ version. If B has none (or an old one), A reports that instead of failing obscur
   streams share the WebSocket, each with its own decoder.
 * **Timestamps**: video `capture_us` = when the encoder took the frame;
   audio `ts_us` = when its first sample "started playing" (the `Write`
-  arrival, like a sound card starting a buffer), kept continuous across
-  packets and pulled slowly towards the arrival times (re-anchored on jumps
-  > 20 ms). Both are CLOCK_MONOTONIC.
+  arrival, like a sound card starting a buffer). Both are CLOCK_MONOTONIC.
+  Audio timestamps are a sample clock: +10 ms per packet, pulled by 1/16 of
+  the error per `Write` towards the arrival times (which jitter by about one
+  QEMU timer tick). A `Write` more than 20 ms late is either a **stall** or a
+  **gap**:
+  - **Stall:** QEMU's main loop or the audio thread was held up, e.g. by a
+    CPU-bound x264 encode. No sample is missing, and QEMU hands over the
+    backlog faster than real time, so the next `Write` comes early. The clock
+    stays continuous, the viewer sees late packets, and its jitter buffer
+    grows to cover them.
+  - **Gap:** the guest produced nothing for a while without stopping its
+    stream. Samples are missing and the next `Write` comes on time. The clock
+    re-anchors at the arrival, and the viewer plays silence for the jump.
+
+  The late `Write`'s samples wait in the fifo until the next `Write` (5–10 ms,
+  at most 25 ms) shows which case it is, so after a gap the new audio carries
+  its new time from its first packet. A new stream (`SetEnabled`, voice
+  switch, first viewer) or anything more than 1 s off re-anchors at once.
+* **QEMU audio timer** (`timer-period=5000` on the `-audiodev`, set by the
+  qemu-server patch). QEMU's mixing buffer for the D-Bus backend is one
+  480-frame (10 ms) buffer, and the audio timer re-arms itself one period
+  *after* each run finishes. With the default 10 ms period it can never
+  deliver 48 kHz: on the development host it averaged one `Write` per
+  10.24 ms, i.e. **46.85 kHz, 2.4 % short**, and more under host CPU load.
+  The viewer played that at 48 kHz, so its buffer drained, the rate control
+  sat at −0.5 % and it ran dry every 3–5 s. A 5 ms period leaves 2× headroom,
+  and QEMU's own rate control still holds the output to real time
+  (48.00 kHz measured). This only takes effect after the VM is stopped and
+  started again.
+* **Opus decoding keeps the host times itself.** Chromium's `AudioDecoder`
+  ignores the timestamps of all chunks after the first and counts decoded
+  samples from there (checked in Chromium 156: a +5 s jump in the input came
+  out unchanged as +10 ms). So every gap or re-anchor in the daemon was lost,
+  and the decoded audio's host times fell further behind real time with each
+  one. The decoder now gets gap-free virtual timestamps (cumulative samples,
+  which it returns unchanged either way), and `audio.js` maps each output
+  back to the packet's real `ts_us` through a small queue.
 * **Viewer** (`www/audio.js`): `off = min(arrival − host time)` over the last
   5–10 s of both streams absorbs the clock offset and the network base delay
   (the same for both, so they cancel). Audio delay = time heard
@@ -319,7 +353,23 @@ version. If B has none (or an old one), A reports that instead of failing obscur
   otherwise slowly drains the buffer into a dropout every minute or two at a
   few hundred ppm) and lets the buffer grow without a gap when target rises.
   Above target + max(20 ms, target/2) it drains at up to +1 %; beyond
-  target + 300 ms it jumps, crossfading old and new over 5 ms. All level
+  target + 300 ms it jumps, crossfading old and new over 5 ms. A forward jump
+  of ≥ 5 ms in the host timestamps (a gap in the guest's audio, see
+  *Timestamps*) is filled with as much silence (max 300 ms), with the audio
+  before it faded out and the audio after it faded in. That keeps the buffer
+  level and the timing of what follows. Without it each gap drained the
+  buffer for good, which the ±0.5 % rate control can only refill at 5 ms/s,
+  and pre-gap and post-gap audio were butted together (a click). Running
+  dry over such a gap is not counted as a dropout and adds no penalty.
+  The worklet also measures the rate the source really delivers (frames
+  written ÷ host time they cover, over 5–20 s) and plays at that rate when it
+  is more than 0.2 % off. This covers VMs still running with QEMU's 10 ms
+  timer, which deliver ~2.4 % too little. Shown as `source −2.4 %`; restart
+  the VM to fix it at the source. In the first second after a (re)start, it
+  jumps back to target once the buffer is more than 20 ms over it (300 ms
+  later on): the rest of a backlog that arrives after a stall would otherwise
+  keep audio, and with lip sync the video, a few hundred ms late for half a
+  minute. All level
   changes are 5 ms gain ramps: it fades out so it reaches 0 exactly when the
   buffer runs dry, and back in when audio returns, so dropouts never click.
   Resampling (drift control, contexts not at 48 kHz) uses 4-point Hermite
@@ -376,7 +426,7 @@ version. If B has none (or an old one), A reports that instead of failing obscur
 ### Proxmox files patched (all pure insertions between `pve-h264-console BEGIN/END` markers)
 | File | Change |
 |---|---|
-| `/usr/share/perl5/PVE/QemuServer.pm` | add `-display dbus,p2p=yes` after `-vnc`; `audio0` with the (default) `spice` driver: `-audiodev spice,…` → `dbus,…,out.frequency=48000,out.channels=2` plus `audiodev=` on the display (not with `audio = 0` in `h264d.conf`); spice agent port chardev `spicevmc` → `dbus` (all skipped for `virtio-gl` or user `args` containing `-display`) |
+| `/usr/share/perl5/PVE/QemuServer.pm` | add `-display dbus,p2p=yes` after `-vnc`; `audio0` with the (default) `spice` driver: `-audiodev spice,…` → `dbus,…,timer-period=5000,out.frequency=48000,out.channels=2` plus `audiodev=` on the display (not with `audio = 0` in `h264d.conf`); spice agent port chardev `spicevmc` → `dbus` (all skipped for `virtio-gl` or user `args` containing `-display`) |
 | `/usr/share/perl5/PVE/API2/Qemu.pm` | new API methods `h264proxy` (POST, VM.Console; runs on the browser's node, relays VMs on other nodes over cluster SSH) and `h264websocket` (GET) |
 | `/usr/share/perl5/PVE/Service/pveproxy.pm` | serve `/h264/`; render viewer for `?console=kvm&h264=1`; append `-h264.<mtime>` to the UI script's `?ver=` cache-busting tag |
 | `/usr/share/perl5/PVE/APIServer/AnyEvent.pm` | `TCP_NODELAY` on websocket proxy legs |
@@ -733,7 +783,12 @@ python3 tools/h264-clipboard-test.py <vmid>
 ```
 
 `tools/h264-browser-test.py` drives a headless Chromium through the real viewer page. Its
-modes are `view`, `esc`, `perf`, `ui`, `mouse` and `settings`.
+modes are `view`, `esc`, `perf`, `ui`, `mouse`, `settings` and `audio` (sound on, lip sync
+per `LIPSYNC=0/1`, audio stats every 5 s for `SECS` seconds).
+
+The test source's tone can imitate a guest's audio problems. Every 3 s, `:gaps[=ms]` leaves
+out that much audio (default 300) and `:stalls[=ms]` holds it back, then hands it over at
+once (default 80), e.g. `PVE_H264D_TEST=2560x1260:gaps=40`.
 
 ### Test log (development host)
 
@@ -804,8 +859,28 @@ worklet driven with synthetic packet timing) also showed: device clock
 before (2nd difference 0.46), now crossfaded (0.005, same as the tone). Audio decode still runs on the page's main
 thread, so a long main-thread stall can still cause one.
 
-Not yet verified: sound from a real guest OS, a desktop browser and its
-audio device.
+**Audio timestamps and real-guest rate (2026-11-05)**, headless Chromium
+156, lip sync on, 40–60 s each, x264 forced (`backend = x264`), test pattern
+at 2560×1260 unless noted. *Before* = the code before this fix, *after* =
+now:
+
+| Case | Before | After |
+|---|---|---|
+| test tone, 300 ms gap every 3 s (`:gaps`) | A/V and "audio delay" grow 300 ms per gap (+4.9 s after 50 s); jitter 3 s; 2 dropouts counted | A/V −20…+49 ms, jitter 59–73 ms, 0 dropouts |
+| test tone, 40 ms gap every 3 s (`:gaps=40`) | – | every gap played as silence, A/V −14…−9 ms, 0 underruns |
+| test tone, 80 ms stall + backlog every 3 s (`:stalls`) | – | no silence inserted (continuous), jitter ~107 ms, A/V −17…−5 ms, 0 dropouts |
+| test tone 2.4 % slow (`:slow=24`, an unrestarted VM) | – | `source −2.4 %`, 0 dropouts after the first 5 s, A/V −22…−7 ms |
+| Ubuntu 26.04 live guest, `speaker-test` 440 Hz, 10 ms QEMU timer | QEMU 46.85 kHz; rate −0.5 %, buffer below target, dropout every 3–5 s | – |
+| same guest, `timer-period=5000` | – | QEMU 48.00 kHz; 0 dropouts, jitter 24–30 ms, A/V −18…−9 ms |
+| same, QEMU starved (6 busy loops at nice −10 on 6 cores, viewer reniced) | – | 2 dropouts in 60 s (first 78 ms and 235 ms QEMU stalls), A/V −18…−13 ms, +81…+111 after the 235 ms stall (lip-sync hold limit of 300 ms with headless Chromium's 170 ms output latency) |
+
+Chromium's `AudioDecoder` timestamps checked directly: 100 Opus packets with
+a +5 s jump at packet 50 came out with the jump removed (outputs
+first input + 10 ms each).
+
+Not yet verified: a desktop browser and its audio device, a cluster relay
+(the relay is a plain SSH + socat byte pipe, and the user's stats showed rtt 1.9 ms /
+queue 1 ms through it).
 
 ## 11. Known limitations / TODO
 
@@ -854,6 +929,7 @@ offset.
 | "failed to start H.264 console daemon" | `journalctl -u pve-h264d@<vmid>` |
 | Clipboard unavailable / not working | the panel (📋 Clipboard) shows the reason; `journalctl -u pve-h264d@<vmid> \| grep -i "clipboard\|vdagent"`. "no spice agent port" = `vga` isn't virtio/qxl, or the VM was started before the install (stop + start); "not running" = start the spice agent in the guest (Windows: *spice-agent* service from the virtio-win guest tools; Linux: `spice-vdagent`, needs an X11/XWayland session for the clipboard). Pasting does nothing: the browser must allow clipboard access for the PVE page; the panel's box always works (paste into it, *Send to guest*) |
 | Windows guest doesn't resize | `journalctl -u pve-h264d@<vmid> \| grep -i "resize\|vdagent"`: `guest-exec resize:` lines give the reason (agent not responding, nobody logged in, Win32 error from SetDisplayConfig); for the spice agent path: "not on D-Bus" = VM started before the update (stop + start); no "guest agent connected" = `spice-agent` service not running in the guest; guest log `No suitable mode found` = the driver doesn't list that size (hint not applied yet, or larger than its framebuffer) |
+| Sound stutters / clicks; Stats show `source −2.x %` or `rate −0.5 %` with dropouts | the VM still runs with QEMU's default 10 ms audio timer, which delivers ~2–3 % too few samples: stop + start the VM (`qm showcmd <vmid> \| grep -o 'audiodev [^ ]*'` should contain `timer-period=5000`). Jitter of hundreds of ms on a busy host = QEMU stalls under CPU load (§4.11) |
 | Black screen / waiting for video | viewer Stats overlay; `PVE_H264D_DEBUG=1`; check the browser console for decoder errors |
 | Low fps | `vga: std` cap (§4.1); viewer decode time in Stats (software decode?); "paced" counter = viewer/network can't keep up |
 | Encoder falls back to x264 | run `pve-h264d --probe` (lists render nodes, installed VA drivers and why each backend fails). Intel: install `intel-media-va-driver-non-free` (enable Debian `non-free`), check `vainfo --display drm --device /dev/dri/renderD128`; the iGPU must not be bound to vfio/passed through. NVIDIA: driver/`libcuda` and, after a kernel update, `pve-h264-patch gpu-check` |
@@ -1022,3 +1098,29 @@ offset.
   Chromium viewer, ticket binding (wrong or missing relay → 401, bad syntax → 400, used
   socket can't be reopened), socket permissions, 10 s accept timeout, relay cleanup.
   `tools/h264-e2e.py` takes `PVE_NODE`, and both test tools take `PVE_TICKET`.
+* 2026-11-05 — **Audio: A/V offsets of minutes, "jitter" of seconds, clicks
+  and dropouts with real guests.** Three causes:
+  (1) Chromium's `AudioDecoder` ignores the timestamps of all chunks after
+  the first and counts decoded samples, so every gap or re-anchor in the
+  daemon's timestamps was lost. The host times of decoded audio fell behind
+  by the total of all gaps since the decoder opened (156 s on one VM, 4.6 s
+  of "jitter" on another), which broke the A/V offset, lip sync (video held
+  300 ms) and the jitter buffer (target stuck at 250 ms). The decoder now
+  gets gap-free virtual timestamps, and `audio.js` maps outputs back to the
+  real ones.
+  (2) QEMU's D-Bus audio backend delivered ~2.4 % fewer samples than 48 kHz
+  with its default 10 ms timer: one 480-frame buffer per tick, and the
+  timer re-arms a period after each run. Worse under CPU load. The buffer
+  drained, the rate control sat at −0.5 %, and it ran dry every few seconds.
+  The qemu-server patch now adds `timer-period=5000` (48.00 kHz measured),
+  which needs a VM stop + start. The worklet also follows the source's real
+  rate, measured from the timestamps (`source −x %` in the stats), for VMs
+  not restarted yet.
+  (3) Gaps in the guest's audio drained the buffer for good and butted
+  pre-gap and post-gap audio together (a click). The daemon now tells stalls
+  (QEMU catches up: continuous timestamps) from gaps (re-anchor) by holding
+  a late `Write` until the next one. The worklet plays a timestamp gap as
+  faded silence, trims a stall's backlog right after a restart, and running
+  dry over a source gap no longer counts as a dropout.
+  Test source options `:gaps[=ms]`, `:stalls[=ms]`, `:slow[=‰]`; browser
+  test mode `audio`. Results in §10. The cluster relay was not involved.
