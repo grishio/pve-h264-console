@@ -10,13 +10,14 @@ import { QNUM, COMBOS } from './keymap.js?v=1';
 const S_ = await import('./settings.js' + new URL(import.meta.url).search);
 const A = await import('./audio.js' + new URL(import.meta.url).search);
 const CB = await import('./clipboard.js' + new URL(import.meta.url).search);
+const RH = await import('./resizehelp.js' + new URL(import.meta.url).search);
 
 const C = { AUTH: 1, KEY: 2, MOUSE_ABS: 3, MOUSE_BTN: 4, MOUSE_REL: 5, ACK: 6,
     CONFIG: 7, KEYFRAME: 8, PING: 9, RESIZE: 10, CLIPBOARD: 0x0c };
 const S = { HELLO: 0x81, VIDEO_CONFIG: 0x82, FRAME: 0x83, CURSOR: 0x84,
     CURSOR_POS: 0x85, PONG: 0x86, STATS: 0x87, ERROR: 0x88, MOUSE_MODE: 0x89,
     DISPLAY_OFF: 0x8a, SETTINGS: 0x8b, NOTICE: 0x8c, AUDIO_STATE: 0x8d, AUDIO: 0x8e,
-    CLIPBOARD: 0x8f, CLIPBOARD_STATE: 0x90 };
+    CLIPBOARD: 0x8f, CLIPBOARD_STATE: 0x90, RESIZE_STATE: 0x91 };
 
 const params = new URLSearchParams(location.search);
 const vmid = params.get('vmid');
@@ -97,6 +98,7 @@ function configureDecoder(cfg) {
     decodeStart.clear();
     flushHeld(false);
     videoW = cfg.width; videoH = cfg.height;
+    RH.onGuestSize(videoW, videoH);
     canvas.width = videoW; canvas.height = videoH;
     layout();
     const conf = { codec: cfg.codec, codedWidth: cfg.coded_width, codedHeight: cfg.coded_height,
@@ -259,6 +261,7 @@ function handleMsg(type, dv, off, len) {
     case S.NOTICE: showNotice(str(dv, off, len)); break;
     case S.CLIPBOARD: CB.onGuestText(str(dv, off + 1, len - 1), dv.getUint8(off)); break;
     case S.CLIPBOARD_STATE: CB.onState(JSON.parse(str(dv, off, len))); break;
+    case S.RESIZE_STATE: if ($('autoresize').checked) RH.onState(JSON.parse(str(dv, off, len))); break;
     case S.PONG: {
         const t = dv.getFloat64(off, true);
         const rtt = performance.now() - t;
@@ -329,6 +332,7 @@ async function connect() {
         A.disconnected();
         flushHeld(false);
         CB.onDisconnect();
+        RH.reset();
         if (decoder && decoder.state !== 'closed') decoder.close();
         decoder = null;
         if (!fatal) scheduleReconnect(false);
@@ -469,6 +473,7 @@ async function togglePowerMenu(force) {
     if (!powerOpen) { m.hidden = true; return; }
     if (S_.isOpen()) S_.toggle(false);
     CB.close();
+    RH.close();
     const wrapR = $('wrap').getBoundingClientRect(), r = btn.getBoundingClientRect();
     m.style.left = Math.max(6, r.left - wrapR.left) + 'px';
     renderPowerMenu();
@@ -751,7 +756,13 @@ function initToolbar() {
         keyEvent,
         notice: showNotice,
         focus: () => canvas.focus(),
-        closeOthers: () => { if (S_.isOpen()) S_.toggle(false); togglePowerMenu(false); },
+        closeOthers: () => { if (S_.isOpen()) S_.toggle(false); togglePowerMenu(false); RH.close(); },
+    });
+    RH.init({
+        vmid,
+        notice: showNotice,
+        focus: () => canvas.focus(),
+        closeOthers: () => { if (S_.isOpen()) S_.toggle(false); togglePowerMenu(false); CB.close(); },
     });
     S_.initSettings({
         audio: A,
@@ -779,7 +790,7 @@ function initToolbar() {
     };
 
     ar.checked = store.get('autoresize', '0') === '1';
-    ar.onchange = () => { store.set('autoresize', ar.checked ? '1' : '0'); if (ar.checked) requestGuestResize(); };
+    ar.onchange = () => { store.set('autoresize', ar.checked ? '1' : '0'); if (ar.checked) requestGuestResize(); else RH.reset(); };
 
     const def = $('defconsole');
     def.checked = store.get('default', '0') === '1';

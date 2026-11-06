@@ -33,6 +33,7 @@
             </select>
         </label>
         <label title="Ask the guest (virtio-gpu) to match the window size"><input type="checkbox" id="autoresize"> Resize guest</label>
+        <button id="resizehelpbtn" class="warn" title="The guest did not follow the window size: how to fix it" aria-expanded="false" hidden><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M8 1.8l6.6 12H1.4z"/><path d="M8 6.2v3.6M8 11.9v.1"/></svg> Fix resize</button>
         <label title="Relative-mouse guests only (e.g. BIOS, no USB tablet): lock the pointer to the console on click for exact, unbounded movement. Off = noVNC-style, pointer stays free."><input type="checkbox" id="capture"> Capture mouse</label>
         <label title="Show statistics overlay"><input type="checkbox" id="showstats"> Stats</label>
         <label title="Use the H.264 console for this browser's VM Console tab"><input type="checkbox" id="defconsole"> Default</label>
@@ -57,6 +58,10 @@
             </div>
             <label class="c-auto" title="Ctrl+V in the console sends your clipboard to the guest first; text copied in the guest goes to your clipboard"><input type="checkbox" id="clipauto"> Sync automatically</label>
             <div class="p-note">Ctrl+V (Shift+Insert) in the console pastes your clipboard into the guest; text copied in the guest goes to your clipboard. Needs the spice agent in the guest (spice-vdagent, or the virtio-win guest tools).</div>
+        </div>
+        <div id="resizepanel" hidden>
+            <div class="p-head"><strong id="resizetitle">Resize guest</strong><span id="resizeinfo" class="p-enc"></span><button id="resizeclose" class="p-close" title="Close">×</button></div>
+            <div id="resizebody"></div>
         </div>
         <div id="startdlg" hidden>
             <div id="startinfo">Guest not running</div>

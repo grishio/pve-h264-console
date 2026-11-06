@@ -23,7 +23,7 @@ install -D -m 0755 daemon/pve-h264d /usr/local/sbin/pve-h264d
 
 echo ">> installing web viewer"
 install -d -m 0755 /usr/share/pve-h264-console
-install -m 0644 www/index.html.tpl www/h264.js www/settings.js www/audio.js www/audio-worklet.js www/clipboard.js www/keymap.js www/h264.css /usr/share/pve-h264-console/
+install -m 0644 www/index.html.tpl www/h264.js www/settings.js www/audio.js www/audio-worklet.js www/clipboard.js www/resizehelp.js www/keymap.js www/h264.css /usr/share/pve-h264-console/
 
 echo ">> installing systemd unit + config"
 install -D -m 0644 systemd/pve-h264d@.service /etc/systemd/system/pve-h264d@.service

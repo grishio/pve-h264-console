@@ -220,8 +220,16 @@ version. If B has none (or an old one), A reports that instead of failing obscur
    fallback can't help there: it sets modes with XRandR, which only works on
    X11. The daemon watches the scanout (15 s for Windows, 5 s otherwise; a
    compositor that follows the hint does so within a second or two) and, if
-   the size didn't change, sends the viewers an `S_NOTICE` with the likely
-   cause (once per size, until a resize succeeds).
+   the size didn't change, sends the viewers `S_RESIZE_STATE` (size, guest
+   OS id from `guest-get-osinfo` reduced to `[a-z0-9._-]`, whether the QEMU
+   guest agent and spice-vdagent answer; once per size, `{ok:true}` after a
+   resize succeeds, and to a viewer that connects while it's failed). The
+   viewer then shows a **Fix resize** button next to *Resize guest*: its panel
+   (`www/resizehelp.js`) gives the steps for that guest (Windows: guest agent,
+   logged-in user, `vga: virtio`; Linux: a one-off `hyprctl` command and a udev
+   hook for Hyprland, `swaymsg` for sway, spice-vdagent for X11 desktops) with
+   Copy buttons. The button goes away when the guest reaches that size
+   (`S_VIDEO_CONFIG`), when *Resize guest* is unticked, or on reconnect.
 10. **libavcodec's NVENC reconfigure forces an IDR**: changing `rc_max_rate` /
    `bit_rate` at runtime makes FFmpeg call `nvEncReconfigureEncoder` with
    `resetEncoder = forceIDR = 1`, so *every* ABR step sent a full keyframe.
@@ -411,6 +419,7 @@ version. If B has none (or an old one), A reports that instead of failing obscur
 | `www/audio.js` | viewer: audio decode (WebCodecs Opus / PCM), jitter buffer control, A/V delay measurement, lip sync |
 | `www/audio-worklet.js` | viewer: AudioWorklet playout (ring buffer, rebuffering, drift catch-up) |
 | `www/clipboard.js` | viewer: clipboard sharing (paste interception, local clipboard writes, Clipboard panel) |
+| `www/resizehelp.js` | viewer: *Fix resize* button and help panel when the guest doesn't follow *Resize guest* |
 | `www/keymap.js` | `KeyboardEvent.code` → QEMU qnum table, key combos |
 | `www/h264.css` | viewer styles |
 | `patches/pve-h264-patch` | idempotent patcher for the PVE files (apply/revert/status) |
@@ -595,7 +604,7 @@ pve-h264-patch status # verify
 | ⚙ Stream | settings panel: profiles (Low bitrate / Desktop / Video / Max quality), rate control, bitrate ceiling, adaptive bitrate, preset, tuning, two-pass, AQ, fps, frames in flight (encoder settings are shared by all viewers of that VM); guest resolution / DPI, scaling filter, lip sync and volume (this browser) |
 | scale | fit, fit without upscaling, 1:1 CSS px, or 1:1 device px |
 | 📋 Clipboard | text clipboard shared with the guest: **Ctrl+V** (Shift+Insert) in the console pastes your local clipboard into the guest, and text copied in the guest lands on your local clipboard. Needs the spice agent in the guest (`spice-vdagent` on Linux, the virtio-win guest tools on Windows) and `vga: virtio` or `qxl` |
-| Resize guest | asks the guest to match the window size, times the panel's *Guest resolution* (0.5×–2×, or native device pixels for HiDPI) (virtio-gpu guests; Windows also needs the QEMU guest agent; Linux: GNOME/KDE follow, Hyprland/sway don't). If the guest doesn't follow, the console says so |
+| Resize guest | asks the guest to match the window size, times the panel's *Guest resolution* (0.5×–2×, or native device pixels for HiDPI) (virtio-gpu guests; Windows also needs the QEMU guest agent; Linux: GNOME/KDE follow, Hyprland/sway don't). If the guest doesn't follow, a **Fix resize** button appears with the steps for that guest |
 | Capture mouse | relative-mouse guests only: lock the pointer on click (Esc releases); off = noVNC-style |
 | Stats | fps, bitrate, encode/decode time, RTT, estimated latency |
 | Default | use H.264 for this browser's Console tab and Console button |
@@ -745,6 +754,7 @@ Every message: `u32 len (LE, = 1 + payload) | u8 type | payload`.
 | C→S | `0x0C CLIPBOARD` | UTF-8 text (LF line ends, ≤ 1 MiB): the viewer's clipboard; the daemon grabs the guest clipboard for it. Larger than one websocket frame: the viewer splits the stream into ≤ 64 KiB frames (pveproxy drops frames > 128 KiB) |
 | S→C | `0x8F CLIPBOARD` | `u8 flags, UTF-8 text`: the guest's clipboard (LF). flags bit 0 = *replay*: the latest shared text, sent on connect and to other viewers when one pastes; shown in the panel, not written to the local clipboard |
 | S→C | `0x90 CLIPBOARD_STATE` | JSON `{available, to_guest, from_guest, max, reason}`; after HELLO and on every change (agent starts/stops) |
+| S→C | `0x91 RESIZE_STATE` | JSON `{ok:false, w, h, guest ("windows"/"other"/"unknown"), os, qga, vdagent}` when the guest didn't follow *Resize guest* (once per size; also after HELLO while failed), `{ok:true}` once a resize works again |
 
 STATS also carries `audio_kbps`.
 
@@ -1168,8 +1178,10 @@ offset.
   guests on Hyprland (Omarchy), sway and other wlroots compositors ignore the
   virtio-gpu resize hint, and spice-vdagent can only switch modes on X11, so
   *Resize guest* silently did nothing (the daemon logged it after 15 s). The
-  daemon now sends the viewers an `S_NOTICE` with the likely cause (Windows:
+  daemon now tells the viewers the likely cause (Windows:
   guest agent / logged-in user; others: compositor ignores hints, plus whether
   spice-vdagent runs), once per size, after 5 s for non-Windows guests
-  (15 s for Windows). Docs: §4.8 Linux note, troubleshooting row with a
-  Hyprland udev workaround.
+  (15 s for Windows). The viewer shows a **Fix resize** button next to
+  *Resize guest* (new `S_RESIZE_STATE` 0x91 instead of a plain notice) whose
+  panel gives the steps for that guest with Copy buttons (`www/resizehelp.js`).
+  Docs: §4.8 Linux note, troubleshooting row with a Hyprland udev workaround.

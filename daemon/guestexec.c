@@ -183,6 +183,8 @@ static uint32_t g_pend_w, g_pend_h;
 static bool g_pend;
 static enum { OS_UNKNOWN, OS_WINDOWS, OS_OTHER } g_os;
 static atomic_bool g_is_windows;
+static char g_os_id[33];          /* written once, before g_os_known */
+static atomic_bool g_os_known;
 static uint64_t g_seq;
 static char *g_start_cmd; /* guest-exec JSON for START_SCRIPT, built once */
 
@@ -416,6 +418,13 @@ static bool detect_os(void)
         return false;
     char *id = json_str(r, "id");
     g_os = id && !strcmp(id, "mswindows") ? OS_WINDOWS : OS_OTHER;
+    /* the id comes from the guest: keep a safe subset, it goes to viewers */
+    size_t n = 0;
+    for (const char *p = id ? id : "unknown"; *p && n < sizeof(g_os_id) - 1; p++)
+        if (g_ascii_isalnum(*p) || *p == '.' || *p == '_' || *p == '-')
+            g_os_id[n++] = g_ascii_tolower(*p);
+    g_os_id[n] = 0;
+    atomic_store(&g_os_known, true);
     atomic_store(&g_is_windows, g_os == OS_WINDOWS);
     if (g_os == OS_WINDOWS)
         LOG("guest-exec resize: Windows guest, resizing through the guest agent");
@@ -643,6 +652,11 @@ void guestexec_init(int vmid, bool enabled)
         pthread_detach(t);
     else
         g_enabled = false;
+}
+
+const char *guestexec_os_id(void)
+{
+    return atomic_load(&g_os_known) ? g_os_id : "";
 }
 
 bool guestexec_is_windows(void)

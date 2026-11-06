@@ -65,6 +65,8 @@ enum {
                               u16 samples, data (opus packet | s16le interleaved) */
     S_CLIPBOARD = 0x8F,    /* u8 flags, utf8 text: the guest's clipboard */
     S_CLIPBOARD_STATE = 0x90, /* utf8 json {available,to_guest,from_guest,max,reason} */
+    S_RESIZE_STATE = 0x91, /* utf8 json {ok,w,h,guest,os,qga,vdagent}: guest
+                              didn't follow Resize guest (ok:false) or does again */
 };
 
 #define FRAME_FLAG_KEY 0x01
@@ -139,6 +141,9 @@ void clipboard_state_changed(void);
 void guestexec_init(int vmid, bool enabled);
 void guestexec_request_size(uint32_t w, uint32_t h);
 bool guestexec_is_windows(void); /* known Windows guest, feature enabled */
+/* guest-get-osinfo "id" ([a-z0-9._-] only), "" while unknown (agent not
+ * answering, or guest_exec_resize = 0). Any thread. */
+const char *guestexec_os_id(void);
 
 /* audio.c: guest audio from QEMU's D-Bus audio backend (own thread).
  * Timestamps are now_us() (CLOCK_MONOTONIC), the clock video cap_us uses. */

@@ -1826,6 +1826,9 @@ static void config_apply_json(const char *js)
 #undef JS
 }
 
+static uint32_t g_resize_failed_w, g_resize_failed_h; /* 0 = no failure */
+static void resize_state_json(char *buf, size_t n);
+
 static void client_authed(Client *c)
 {
     c->authed = true;
@@ -1846,6 +1849,11 @@ static void client_authed(Client *c)
         client_send(c, S_CURSOR, d, n);
     }
     clipboard_hello(c);
+    if (g_resize_failed_w) {
+        char js[256];
+        resize_state_json(js, sizeof(js));
+        client_send_str(c, S_RESIZE_STATE, js);
+    }
     pthread_mutex_lock(&clients_lock);
     c->need_key = true;
     c->last_sent = c->last_acked = atomic_load(&g_frame_id);
@@ -1884,7 +1892,6 @@ static void client_authed(Client *c)
 #define RESIZE_WATCH_OTHER_S 5
 #define RESIZE_DEBOUNCE_MS 150
 static uint32_t g_resize_w, g_resize_h;
-static uint32_t g_resize_failed_w, g_resize_failed_h; /* last size notified */
 static guint g_resize_timer;
 static int g_resize_checks;
 static bool g_resize_asked;
@@ -1897,8 +1904,26 @@ static bool scanout_is(uint32_t w, uint32_t h)
     return ok;
 }
 
-/* Tell the viewers why the guest didn't follow. Once per size: a viewer that
- * keeps asking for the same size doesn't get the same notice again. */
+/* What the viewers need to explain a failed resize (their help panel picks
+ * the steps): the size, the guest OS as the guest agent reports it, and which
+ * agents answer. All values are numbers, booleans or the sanitized OS id. */
+static void resize_state_json(char *buf, size_t n)
+{
+    if (!g_resize_failed_w) {
+        snprintf(buf, n, "{\"ok\":true}");
+        return;
+    }
+    const char *os = guestexec_os_id();
+    snprintf(buf, n,
+             "{\"ok\":false,\"w\":%u,\"h\":%u,\"guest\":\"%s\",\"os\":\"%s\","
+             "\"qga\":%s,\"vdagent\":%s}",
+             g_resize_failed_w, g_resize_failed_h,
+             !*os ? "unknown" : guestexec_is_windows() ? "windows" : "other", os,
+             *os ? "true" : "false", vdagent_agent_connected() ? "true" : "false");
+}
+
+/* Tell the viewers the guest didn't follow. Once per size: a viewer that
+ * keeps asking for the same size doesn't get the same message again. */
 static void resize_failed(uint32_t w, uint32_t h)
 {
     LOG("guest did not resize to %ux%u", w, h);
@@ -1906,18 +1931,17 @@ static void resize_failed(uint32_t w, uint32_t h)
         return;
     g_resize_failed_w = w;
     g_resize_failed_h = h;
-    char msg[256];
-    if (guestexec_is_windows())
-        snprintf(msg, sizeof(msg),
-                 "Guest did not resize to %ux%u. Windows needs the QEMU guest "
-                 "agent running and a user logged in.", w, h);
-    else
-        snprintf(msg, sizeof(msg),
-                 "Guest did not resize to %ux%u. Its desktop ignores display "
-                 "resize hints (e.g. Hyprland or sway on Wayland): set the "
-                 "resolution in the guest%s.", w, h,
-                 vdagent_agent_connected() ? "" : " (no spice-vdagent running)");
-    broadcast_str(S_NOTICE, msg);
+    char js[256];
+    resize_state_json(js, sizeof(js));
+    broadcast_str(S_RESIZE_STATE, js);
+}
+
+static void resize_ok(void)
+{
+    if (!g_resize_failed_w)
+        return;
+    g_resize_failed_w = g_resize_failed_h = 0;
+    broadcast_str(S_RESIZE_STATE, "{\"ok\":true}");
 }
 
 static gboolean resize_check(gpointer ud)
@@ -1926,7 +1950,7 @@ static gboolean resize_check(gpointer ud)
     if (scanout_is(g_resize_w, g_resize_h)) {
         if (g_resize_asked)
             LOG("guest resized to %ux%u", g_resize_w, g_resize_h);
-        g_resize_failed_w = g_resize_failed_h = 0;
+        resize_ok();
         return G_SOURCE_REMOVE;
     }
     if (!g_resize_asked) {
