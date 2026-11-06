@@ -31,23 +31,34 @@ let cfg = null;   // VM config (null: not read yet / no permission)
 const HOOK_SCRIPT = `#!/bin/sh
 # /usr/local/bin/vm-resize: after a virtio-gpu resize hint (udev, as root),
 # switch running Hyprland / sway sessions to the kernel's new preferred mode.
-sleep 0.3
-for m in /sys/class/drm/card*-Virtual-*/modes; do
-    mode=$(head -n1 "$m" 2>/dev/null)
-    case "$mode" in *[!0-9x]* | x* | *x | *x*x* | '') continue ;; *x*) ;; *) continue ;; esac
-    out=\${m%/modes}; out=\${out##*/}; out=\${out#card*-}
-    for sock in /run/user/*/hypr/*/.socket.sock; do
-        [ -S "$sock" ] || continue
-        dir=\${sock%/.socket.sock}
-        export XDG_RUNTIME_DIR=/run/user/$(stat -c %u "$sock") HYPRLAND_INSTANCE_SIGNATURE=\${dir##*/}
-        # Hyprland 0.55+ (Lua config) takes eval, older ones keyword: the
-        # other one is a no-op, and neither reports that in its exit code
-        /usr/bin/hyprctl eval "hl.monitor({ output = \\"$out\\", mode = \\"$mode\\", position = \\"auto\\", scale = \\"auto\\" })" >/dev/null 2>&1
-        /usr/bin/hyprctl keyword monitor "$out,$mode,auto,auto" >/dev/null 2>&1
+# The event can come before the guest kernel has the new size, so keep
+# looking for 2 s and apply again when it changes.
+apply() {
+    for m in /sys/class/drm/card*-Virtual-*/modes; do
+        mode=$(head -n1 "$m" 2>/dev/null)
+        case "$mode" in *[!0-9x]* | x* | *x | *x*x* | '') continue ;; *x*) ;; *) continue ;; esac
+        out=\${m%/modes}; out=\${out##*/}; out=\${out#card*-}
+        [ "$1" = changed ] && [ "$(cat "/run/vm-resize.$out" 2>/dev/null)" = "$mode" ] && continue
+        echo "$mode" > "/run/vm-resize.$out"
+        for sock in /run/user/*/hypr/*/.socket.sock; do
+            [ -S "$sock" ] || continue
+            dir=\${sock%/.socket.sock}
+            export XDG_RUNTIME_DIR=/run/user/$(stat -c %u "$sock") HYPRLAND_INSTANCE_SIGNATURE=\${dir##*/}
+            # Hyprland 0.55+ (Lua config) takes eval, older ones keyword: the
+            # other one is a no-op, and neither reports that in its exit code
+            /usr/bin/hyprctl eval "hl.monitor({ output = \\"$out\\", mode = \\"$mode@60\\", position = \\"auto\\", scale = \\"auto\\" })" >/dev/null 2>&1
+            /usr/bin/hyprctl keyword monitor "$out,$mode@60,auto,auto" >/dev/null 2>&1
+        done
+        for sock in /run/user/*/sway-ipc.*.sock; do
+            [ -S "$sock" ] && SWAYSOCK=$sock /usr/bin/swaymsg output "$out" mode "$mode@60Hz" >/dev/null 2>&1
+        done
     done
-    for sock in /run/user/*/sway-ipc.*.sock; do
-        [ -S "$sock" ] && SWAYSOCK=$sock /usr/bin/swaymsg output "$out" mode "$mode" >/dev/null 2>&1
-    done
+}
+sleep 0.2
+apply
+for i in 1 2 3 4 5 6 7 8; do
+    sleep 0.25
+    apply changed
 done`;
 const HOOK_INSTALL = `sudo tee /usr/local/bin/vm-resize >/dev/null <<'EOF'
 ${HOOK_SCRIPT}
@@ -224,9 +235,9 @@ function desktopHelp(de) {
     ];
     case 'hypr': return [
         p('Hyprland keeps the list of display modes it read at login, so "preferred" stays the old size. Pass it the new size explicitly. Run as your desktop user (not root or sudo), in a terminal inside the guest:'),
-        codeBlock(`hyprctl eval 'hl.monitor({ output = "Virtual-1", mode = "${size}", position = "auto", scale = "auto" })'`),
+        codeBlock(`hyprctl eval 'hl.monitor({ output = "Virtual-1", mode = "${size}@60", position = "auto", scale = "auto" })'`),
         p('Hyprland before 0.55 (hyprlang config):'),
-        codeBlock(`hyprctl keyword monitor Virtual-1,${size},auto,auto`),
+        codeBlock(`hyprctl keyword monitor Virtual-1,${size}@60,auto,auto`),
         hookSection(),
     ];
     case 'sway': return [

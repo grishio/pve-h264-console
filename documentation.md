@@ -1227,3 +1227,12 @@ offset.
   failure of the same size showed nothing. The daemon now reports every
   failed request (and skips the on-connect report when the guest has reached
   the size since); the viewer shows the message once per size.
+* 2026-11-06 — **udev hook lagged one resize behind.** On Omarchy the guest
+  kernel had the new size (2560x1254 in `/sys/class/drm/…/modes`) while
+  Hyprland was on the previous one (2104x1128): the hook reads the size
+  0.3 s after the event, apparently before virtio-gpu has the new display
+  info. The hook now applies what it finds, then keeps checking for 2 s and
+  applies again when the size changes (last applied size per output in
+  `/run/vm-resize.<output>`). Modes are set at `@60` so Hyprland/sway use the
+  exact size as a custom mode instead of a nearby one from their list.
+  Simulated with a fake sysfs and a stub `hyprctl`; to be confirmed on a guest.
