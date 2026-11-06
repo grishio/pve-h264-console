@@ -222,8 +222,9 @@ version. If B has none (or an old one), A reports that instead of failing obscur
    compositor that follows the hint does so within a second or two) and, if
    the size didn't change, sends the viewers `S_RESIZE_STATE` (size, guest
    OS id from `guest-get-osinfo` reduced to `[a-z0-9._-]`, whether the QEMU
-   guest agent and spice-vdagent answer; once per size, `{ok:true}` after a
-   resize succeeds, and to a viewer that connects while it's failed). The
+   guest agent and spice-vdagent answer; after every failed request, the
+   viewer shows the message once per size; `{ok:true}` after a resize
+   succeeds; and to a viewer that connects while it's still failing). The
    viewer then shows a **Fix resize** button next to *Resize guest*. Its
    panel (`www/resizehelp.js`) reads the VM config with the viewer's own
    permissions (`GET …/config`, VM.Audit; without it, the guest agent's OS id)
@@ -764,7 +765,7 @@ Every message: `u32 len (LE, = 1 + payload) | u8 type | payload`.
 | C→S | `0x0C CLIPBOARD` | UTF-8 text (LF line ends, ≤ 1 MiB): the viewer's clipboard; the daemon grabs the guest clipboard for it. Larger than one websocket frame: the viewer splits the stream into ≤ 64 KiB frames (pveproxy drops frames > 128 KiB) |
 | S→C | `0x8F CLIPBOARD` | `u8 flags, UTF-8 text`: the guest's clipboard (LF). flags bit 0 = *replay*: the latest shared text, sent on connect and to other viewers when one pastes; shown in the panel, not written to the local clipboard |
 | S→C | `0x90 CLIPBOARD_STATE` | JSON `{available, to_guest, from_guest, max, reason}`; after HELLO and on every change (agent starts/stops) |
-| S→C | `0x91 RESIZE_STATE` | JSON `{ok:false, w, h, guest ("windows"/"other"/"unknown"), os, qga, vdagent}` when the guest didn't follow *Resize guest* (once per size; also after HELLO while failed), `{ok:true}` once a resize works again |
+| S→C | `0x91 RESIZE_STATE` | JSON `{ok:false, w, h, guest ("windows"/"other"/"unknown"), os, qga, vdagent}` when the guest didn't follow *Resize guest* (after every failed request; also after HELLO while still failing), `{ok:true}` once a resize works again |
 
 STATS also carries `audio_kbps`.
 
@@ -1220,3 +1221,9 @@ offset.
   udev hook now reads the size from `/sys/class/drm` and uses `eval` (plus
   `keyword` for older Hyprland, and sway). The hook itself is not yet
   verified end to end on a guest.
+* 2026-11-06 — **Resize failure not reported again.** The daemon sent a failed
+  size only once, but the viewer forgets it when *Resize guest* is unticked
+  and ticked again, or when the guest briefly reaches the size, so a repeat
+  failure of the same size showed nothing. The daemon now reports every
+  failed request (and skips the on-connect report when the guest has reached
+  the size since); the viewer shows the message once per size.

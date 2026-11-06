@@ -1828,6 +1828,7 @@ static void config_apply_json(const char *js)
 
 static uint32_t g_resize_failed_w, g_resize_failed_h; /* 0 = no failure */
 static void resize_state_json(char *buf, size_t n);
+static bool scanout_is(uint32_t w, uint32_t h);
 
 static void client_authed(Client *c)
 {
@@ -1849,7 +1850,9 @@ static void client_authed(Client *c)
         client_send(c, S_CURSOR, d, n);
     }
     clipboard_hello(c);
-    if (g_resize_failed_w) {
+    /* still failing: the guest may have reached the size since (fixed by
+     * hand in the guest), then there is nothing to report */
+    if (g_resize_failed_w && !scanout_is(g_resize_failed_w, g_resize_failed_h)) {
         char js[256];
         resize_state_json(js, sizeof(js));
         client_send_str(c, S_RESIZE_STATE, js);
@@ -1922,13 +1925,13 @@ static void resize_state_json(char *buf, size_t n)
              *os ? "true" : "false", vdagent_agent_connected() ? "true" : "false");
 }
 
-/* Tell the viewers the guest didn't follow. Once per size: a viewer that
- * keeps asking for the same size doesn't get the same message again. */
+/* Tell the viewers the guest didn't follow, after every failed request: a
+ * viewer may have dropped the last one (Resize guest unticked and ticked
+ * again, the guest reached the size in between). The viewer doesn't repeat
+ * a message it is already showing. */
 static void resize_failed(uint32_t w, uint32_t h)
 {
     LOG("guest did not resize to %ux%u", w, h);
-    if (w == g_resize_failed_w && h == g_resize_failed_h)
-        return;
     g_resize_failed_w = w;
     g_resize_failed_h = h;
     char js[256];

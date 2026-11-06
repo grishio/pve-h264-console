@@ -331,9 +331,13 @@ export function isOpen() { return open; }
 
 // S_RESIZE_STATE from the daemon
 export function onState(s) {
+    const prev = state;
     state = s && typeof s === 'object' ? s : { ok: true };
     setFailed(!state.ok);
-    if (!state.ok) api.notice(`Guest did not resize to ${state.w}x${state.h}. Click "Fix resize" for how to fix it.`);
+    // the daemon reports every failed request: say it once per size while
+    // the button is up, not again for each retry of the same size
+    if (!state.ok && (prev.ok || prev.w !== state.w || prev.h !== state.h))
+        api.notice(`Guest did not resize to ${state.w}x${state.h}. Click "Fix resize" for how to fix it.`);
     if (open) render();
 }
 
