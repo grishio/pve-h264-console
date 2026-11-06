@@ -31,10 +31,12 @@ let cfg = null;   // VM config (null: not read yet / no permission)
 const HOOK_SCRIPT = `#!/bin/sh
 # /usr/local/bin/vm-resize: after a virtio-gpu resize hint (udev, as root),
 # switch running Hyprland / sway sessions to the kernel's new preferred mode.
-# The event can come before the guest kernel has the new size, so keep
-# looking for 2 s and apply again when it changes.
+# The event comes before the guest kernel has the new size, and the modes
+# file only changes when something probes the display again: so probe
+# ("detect") before each read, and keep looking for 2 s.
 apply() {
     for m in /sys/class/drm/card*-Virtual-*/modes; do
+        echo detect > "\${m%/modes}/status" 2>/dev/null
         mode=$(head -n1 "$m" 2>/dev/null)
         case "$mode" in *[!0-9x]* | x* | *x | *x*x* | '') continue ;; *x*) ;; *) continue ;; esac
         out=\${m%/modes}; out=\${out##*/}; out=\${out#card*-}

@@ -235,9 +235,10 @@ version. If B has none (or an old one), A reports that instead of failing obscur
    desktop picker (remembered per VM): GNOME and KDE follow by themselves
    (fixed resolutions saved in their settings, spice-vdagent on X11), Hyprland
    and sway need the exact size, because they keep the mode list from login
-   (a one-off `hyprctl eval` / `swaymsg` command, and a udev hook that reads
-   the kernel's new preferred mode from `/sys/class/drm/*/modes`, accepts only
-   `WxH`, and passes it to every running session), X11 desktops need
+   (a one-off `hyprctl eval` / `swaymsg` command, and a udev hook that
+   re-probes the connector — `echo detect > …/status` — reads the kernel's new
+   preferred mode from `/sys/class/drm/*/modes`, accepts only `WxH`, and passes
+   it to every running session as `WxH@60`, re-checking for 2 s), X11 desktops need
    spice-vdagent (install command by distribution). Commands have Copy
    buttons. The button goes away when the guest reaches that size
    (`S_VIDEO_CONFIG`), when *Resize guest* is unticked, or on reconnect.
@@ -1236,3 +1237,15 @@ offset.
   `/run/vm-resize.<output>`). Modes are set at `@60` so Hyprland/sway use the
   exact size as a custom mode instead of a nearby one from their list.
   Simulated with a fake sysfs and a stub `hyprctl`; to be confirmed on a guest.
+* 2026-11-06 — **udev hook: re-probe the display; quieter guest-agent check.**
+  Debug logging on Omarchy (hook and daemon timestamps lined up to ~10 ms)
+  showed that the guest's uevent comes right after the hint, but
+  `/sys/class/drm/card1-Virtual-1/modes` still lists the previous size, and
+  stays that way, without another event, until something probes the
+  connector again. Polling longer can't help. The hook now writes `detect` to the
+  connector's sysfs `status` (a forced probe) before each read. Confirmed
+  on the guest: every resize now lands on the requested size. A probe that
+  finds a new size may send one more uevent, and the hook then sees the size
+  it already applied. The daemon no longer asks a missing QEMU guest agent on every
+  resize (each try waited for the agent timeout and logged a line): it
+  retries at most every 60 s and logs the first miss only.

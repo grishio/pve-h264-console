@@ -555,12 +555,28 @@ static void log_result(uint32_t w, uint32_t h, long rc, int64_t t0, bool started
         LOG("guest-exec resize: listener failed (result 0x%lx)", (unsigned long)rc);
 }
 
+/* Without a guest agent, each try costs the agent timeout: ask again at most
+ * every DETECT_RETRY_S (the agent may start later), and log only the first
+ * miss. Linux guests resize without it, so this isn't an error for them. */
+#define DETECT_RETRY_S 60
+static int64_t g_detect_next_us;
+static bool g_detect_logged;
+
 static void do_resize(uint32_t w, uint32_t h)
 {
-    if (g_os == OS_UNKNOWN && !detect_os()) {
-        LOG("guest-exec resize: QEMU guest agent not responding (installed "
-            "and running in the guest? 'agent: 1' in the VM config?)");
-        return;
+    if (g_os == OS_UNKNOWN) {
+        if (now_us() < g_detect_next_us)
+            return;
+        if (!detect_os()) {
+            g_detect_next_us = now_us() + DETECT_RETRY_S * 1000000LL;
+            if (!g_detect_logged)
+                LOG("guest-exec resize: QEMU guest agent not responding (installed "
+                    "and running in the guest? 'agent: 1' in the VM config?); "
+                    "Windows guests need it to resize. Retrying every %d s, quietly",
+                    DETECT_RETRY_S);
+            g_detect_logged = true;
+            return;
+        }
     }
     if (g_os != OS_WINDOWS)
         return;
