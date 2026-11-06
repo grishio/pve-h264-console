@@ -578,6 +578,11 @@ void vdagent_attach(void *conn, int clip_mode)
     g_object_unref(fdl);
 }
 
+bool vdagent_agent_connected(void)
+{
+    return g_agent_ready;
+}
+
 void vdagent_request_size(uint32_t w, uint32_t h)
 {
     g_want_w = w;

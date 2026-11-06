@@ -1873,13 +1873,18 @@ static void client_authed(Client *c)
  *     retries until the driver has the new mode), otherwise only if the
  *     scanout hasn't changed a second later (spice agent, which works for
  *     QXL, and the guest agent path).
- *  3. Watch the scanout for up to RESIZE_WATCH_S and log the outcome.
+ *  3. Watch the scanout for up to RESIZE_WATCH_S (Windows) or
+ *     RESIZE_WATCH_OTHER_S (others: a compositor that follows the hint does
+ *     so within a second or two) and log the outcome; on failure the viewers
+ *     get an S_NOTICE with the likely cause.
  * viogpudo sizes its framebuffer segment once at driver start: 16 MiB unless
  * a built-in mode needs more. Windows refuses larger modes, so clamp to that. */
 #define RESIZE_MAX_PIXELS (16u * 1024 * 1024 / 4)
 #define RESIZE_WATCH_S 15
+#define RESIZE_WATCH_OTHER_S 5
 #define RESIZE_DEBOUNCE_MS 150
 static uint32_t g_resize_w, g_resize_h;
+static uint32_t g_resize_failed_w, g_resize_failed_h; /* last size notified */
 static guint g_resize_timer;
 static int g_resize_checks;
 static bool g_resize_asked;
@@ -1892,20 +1897,45 @@ static bool scanout_is(uint32_t w, uint32_t h)
     return ok;
 }
 
+/* Tell the viewers why the guest didn't follow. Once per size: a viewer that
+ * keeps asking for the same size doesn't get the same notice again. */
+static void resize_failed(uint32_t w, uint32_t h)
+{
+    LOG("guest did not resize to %ux%u", w, h);
+    if (w == g_resize_failed_w && h == g_resize_failed_h)
+        return;
+    g_resize_failed_w = w;
+    g_resize_failed_h = h;
+    char msg[256];
+    if (guestexec_is_windows())
+        snprintf(msg, sizeof(msg),
+                 "Guest did not resize to %ux%u. Windows needs the QEMU guest "
+                 "agent running and a user logged in.", w, h);
+    else
+        snprintf(msg, sizeof(msg),
+                 "Guest did not resize to %ux%u. Its desktop ignores display "
+                 "resize hints (e.g. Hyprland or sway on Wayland): set the "
+                 "resolution in the guest%s.", w, h,
+                 vdagent_agent_connected() ? "" : " (no spice-vdagent running)");
+    broadcast_str(S_NOTICE, msg);
+}
+
 static gboolean resize_check(gpointer ud)
 {
     g_resize_timer = 0;
     if (scanout_is(g_resize_w, g_resize_h)) {
         if (g_resize_asked)
             LOG("guest resized to %ux%u", g_resize_w, g_resize_h);
+        g_resize_failed_w = g_resize_failed_h = 0;
         return G_SOURCE_REMOVE;
     }
     if (!g_resize_asked) {
         g_resize_asked = true;
         vdagent_request_size(g_resize_w, g_resize_h);
         guestexec_request_size(g_resize_w, g_resize_h);
-    } else if (++g_resize_checks >= RESIZE_WATCH_S) {
-        LOG("guest did not resize to %ux%u", g_resize_w, g_resize_h);
+    } else if (++g_resize_checks >=
+               (guestexec_is_windows() ? RESIZE_WATCH_S : RESIZE_WATCH_OTHER_S)) {
+        resize_failed(g_resize_w, g_resize_h);
         return G_SOURCE_REMOVE;
     }
     g_resize_timer = g_timeout_add(1000, resize_check, NULL);

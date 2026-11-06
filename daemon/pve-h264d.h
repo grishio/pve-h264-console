@@ -126,6 +126,7 @@ int probe_main(const EncoderParams *base);
 /* vdagent.c (main thread only); conn is the GDBusConnection to QEMU */
 void vdagent_attach(void *conn, int clip_mode);
 void vdagent_request_size(uint32_t w, uint32_t h);
+bool vdagent_agent_connected(void);
 /* offer a viewer's clipboard text (LF line ends) to the guest */
 bool vdagent_clipboard_set(const char *text, size_t len);
 char *vdagent_clipboard_state_json(void); /* g_free() */

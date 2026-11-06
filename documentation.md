@@ -212,6 +212,16 @@ version. If B has none (or an old one), A reports that instead of failing obscur
    asked for 3576x2254 = 32 MB) and clamped to 16 MiB. CSS pixels also make
    the guest's text the same size as the local desktop's on any client OS,
    since the guest's own display scaling can't be set from the host.
+   **Linux guests** get only the hint: virtio-gpu reports the size as the
+   connector's new preferred mode (with `hotplug_mode_update` set), and the
+   compositor has to switch to it. Mutter (GNOME) and KWin (KDE) do; Hyprland
+   (e.g. Omarchy), sway and other wlroots compositors pick a mode only when the
+   output appears and ignore later mode-list changes. The spice-vdagent
+   fallback can't help there: it sets modes with XRandR, which only works on
+   X11. The daemon watches the scanout (15 s for Windows, 5 s otherwise; a
+   compositor that follows the hint does so within a second or two) and, if
+   the size didn't change, sends the viewers an `S_NOTICE` with the likely
+   cause (once per size, until a resize succeeds).
 10. **libavcodec's NVENC reconfigure forces an IDR**: changing `rc_max_rate` /
    `bit_rate` at runtime makes FFmpeg call `nvEncReconfigureEncoder` with
    `resetEncoder = forceIDR = 1`, so *every* ABR step sent a full keyframe.
@@ -585,7 +595,7 @@ pve-h264-patch status # verify
 | ⚙ Stream | settings panel: profiles (Low bitrate / Desktop / Video / Max quality), rate control, bitrate ceiling, adaptive bitrate, preset, tuning, two-pass, AQ, fps, frames in flight (encoder settings are shared by all viewers of that VM); guest resolution / DPI, scaling filter, lip sync and volume (this browser) |
 | scale | fit, fit without upscaling, 1:1 CSS px, or 1:1 device px |
 | 📋 Clipboard | text clipboard shared with the guest: **Ctrl+V** (Shift+Insert) in the console pastes your local clipboard into the guest, and text copied in the guest lands on your local clipboard. Needs the spice agent in the guest (`spice-vdagent` on Linux, the virtio-win guest tools on Windows) and `vga: virtio` or `qxl` |
-| Resize guest | asks the guest to match the window size, times the panel's *Guest resolution* (0.5×–2×, or native device pixels for HiDPI) (virtio-gpu guests; Windows also needs the QEMU guest agent) |
+| Resize guest | asks the guest to match the window size, times the panel's *Guest resolution* (0.5×–2×, or native device pixels for HiDPI) (virtio-gpu guests; Windows also needs the QEMU guest agent; Linux: GNOME/KDE follow, Hyprland/sway don't). If the guest doesn't follow, the console says so |
 | Capture mouse | relative-mouse guests only: lock the pointer on click (Esc releases); off = noVNC-style |
 | Stats | fps, bitrate, encode/decode time, RTT, estimated latency |
 | Default | use H.264 for this browser's Console tab and Console button |
@@ -947,6 +957,7 @@ offset.
 | VM on another node: connects, then closes at once | task log of the `h264relay` task on the node you're connected to (`ssh`/`socat` errors); on the VM's node `journalctl -u pve-h264d@<vmid>`; check `ssh root@<node>` works from the node you're connected to (`pvecm updatecerts` repairs cluster SSH keys) |
 | "failed to start H.264 console daemon" | `journalctl -u pve-h264d@<vmid>` |
 | Clipboard unavailable / not working | the panel (📋 Clipboard) shows the reason; `journalctl -u pve-h264d@<vmid> \| grep -i "clipboard\|vdagent"`. "no spice agent port" = `vga` isn't virtio/qxl, or the VM was started before the install (stop + start); "not running" = start the spice agent in the guest (Windows: *spice-agent* service from the virtio-win guest tools; Linux: `spice-vdagent`, needs an X11/XWayland session for the clipboard). Pasting does nothing: the browser must allow clipboard access for the PVE page; the panel's box always works (paste into it, *Send to guest*) |
+| "Guest did not resize to WxH" on a Linux guest | the guest's compositor ignores virtio-gpu resize hints (Hyprland/Omarchy, sway; §4.8). Set the resolution in the guest, or let the guest re-pick the preferred mode on each hint, e.g. for Hyprland a udev rule `/etc/udev/rules.d/99-vm-resize.rules`: `ACTION=="change", SUBSYSTEM=="drm", RUN+="/usr/local/bin/vm-resize"`, where `vm-resize` runs `hyprctl keyword monitor ,preferred,auto,1` as the session user (`HYPRLAND_INSTANCE_SIGNATURE` and `XDG_RUNTIME_DIR` of that session) |
 | Windows guest doesn't resize | `journalctl -u pve-h264d@<vmid> \| grep -i "resize\|vdagent"`: `guest-exec resize:` lines give the reason (agent not responding, nobody logged in, Win32 error from SetDisplayConfig); for the spice agent path: "not on D-Bus" = VM started before the update (stop + start); no "guest agent connected" = `spice-agent` service not running in the guest; guest log `No suitable mode found` = the driver doesn't list that size (hint not applied yet, or larger than its framebuffer) |
 | Sound stutters / clicks; Stats show `source −2.x %` or `rate −0.5 %` with dropouts | the VM still runs with QEMU's default 10 ms audio timer, which delivers ~2–3 % too few samples: stop + start the VM (`qm showcmd <vmid> \| grep -o 'audiodev [^ ]*'` should contain `timer-period=5000`). Jitter of hundreds of ms on a busy host = QEMU stalls under CPU load (§4.11) |
 | Black screen / waiting for video | viewer Stats overlay; `PVE_H264D_DEBUG=1`; check the browser console for decoder errors |
@@ -1153,3 +1164,12 @@ offset.
   Tested on 9.2.25 (passes, files byte-identical after re-apply) and with
   simulated failures (QEMU without dbus, failing or missing QEMU, old ticket
   signatures, pve-manager 8.4, no pve-manager) on copies of the patched files.
+* 2026-11-05 — **Resize guest: say when the guest doesn't follow.** Linux
+  guests on Hyprland (Omarchy), sway and other wlroots compositors ignore the
+  virtio-gpu resize hint, and spice-vdagent can only switch modes on X11, so
+  *Resize guest* silently did nothing (the daemon logged it after 15 s). The
+  daemon now sends the viewers an `S_NOTICE` with the likely cause (Windows:
+  guest agent / logged-in user; others: compositor ignores hints, plus whether
+  spice-vdagent runs), once per size, after 5 s for non-Windows guests
+  (15 s for Windows). Docs: §4.8 Linux note, troubleshooting row with a
+  Hyprland udev workaround.
