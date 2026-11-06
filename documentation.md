@@ -603,7 +603,7 @@ pve-h264-patch status # verify
 | ⏻ Power | Start, Shutdown, Reboot, Pause, Resume, Hard Stop, Hard Reset (as in noVNC; needs `VM.PowerMgmt`). When the VM is off the viewer shows a **Start Now** prompt instead of an error, and connects by itself once the VM is running |
 | ⚙ Stream | settings panel: profiles (Low bitrate / Desktop / Video / Max quality), rate control, bitrate ceiling, adaptive bitrate, preset, tuning, two-pass, AQ, fps, frames in flight (encoder settings are shared by all viewers of that VM); guest resolution / DPI, scaling filter, lip sync and volume (this browser) |
 | scale | fit, fit without upscaling, 1:1 CSS px, or 1:1 device px |
-| 📋 Clipboard | text clipboard shared with the guest: **Ctrl+V** (Shift+Insert) in the console pastes your local clipboard into the guest, and text copied in the guest lands on your local clipboard. Needs the spice agent in the guest (`spice-vdagent` on Linux, the virtio-win guest tools on Windows) and `vga: virtio` or `qxl` |
+| 📋 Clipboard | text clipboard shared with the guest: **Ctrl+V** (Shift+Insert) in the console pastes your local clipboard into the guest, and text copied in the guest lands on your local clipboard. Needs the spice agent in the guest (`spice-vdagent` on Linux, the virtio-win guest tools on Windows) and `vga: virtio` or `qxl`. Without the agent (BIOS, installers, login screens), the panel's **Type into guest** types the box's text as key presses (US keyboard layout in the guest; ~12 ms per key event, *Stop typing* cancels) |
 | Resize guest | asks the guest to match the window size, times the panel's *Guest resolution* (0.5×–2×, or native device pixels for HiDPI) (virtio-gpu guests; Windows also needs the QEMU guest agent; Linux: GNOME/KDE follow, Hyprland/sway don't). If the guest doesn't follow, a **Fix resize** button appears with the steps for that guest |
 | Capture mouse | relative-mouse guests only: lock the pointer on click (Esc releases); off = noVNC-style |
 | Stats | fps, bitrate, encode/decode time, RTT, estimated latency |
@@ -943,6 +943,11 @@ queue 1 ms through it).
 * Audio shares the main thread with video decode/drawing on the way to the
   worklet; a WebSocket in a Worker that feeds the worklet directly would make
   sound immune to main-thread stalls.
+* *Type into guest* maps characters for a US keyboard layout (other guest
+  layouts get the wrong symbols; characters a US keyboard can't type are
+  skipped), a guest with Caps Lock on gets inverted letter case, and it is
+  paced at one key event per 12 ms, so long texts take a while (it stops
+  when the console is hidden or disconnects).
 * Clipboard: text only (no images/files), CLIPBOARD selection only (not X11
   PRIMARY), ≤ 1 MiB; needs the spice agent in the guest.
 * Multi-monitor: only console 0.
@@ -1185,3 +1190,11 @@ offset.
   *Resize guest* (new `S_RESIZE_STATE` 0x91 instead of a plain notice) whose
   panel gives the steps for that guest with Copy buttons (`www/resizehelp.js`).
   Docs: §4.8 Linux note, troubleshooting row with a Hyprland udev workaround.
+* 2026-11-05 — **Clipboard: Type into guest.** The Clipboard panel can type
+  its text into the guest as key presses, for guests without the spice agent
+  (BIOS, installers, login screens, no `spice-vdagent`). Characters are mapped
+  for a US layout (Shift as needed, CRLF → Enter, others skipped and counted),
+  sent one key event per 12 ms (the guest's keyboard queue is short: USB HID
+  holds 16 events), with progress and *Stop typing* on the button; longer
+  than 2000 characters asks first. Hiding the console or a disconnect stops
+  it and releases held keys. Tested in headless Chromium (event sequence).

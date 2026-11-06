@@ -11,6 +11,9 @@
 //    (Chromium, after "Allow" once): read it and send it if it changed, so a
 //    paste from the guest's own menus has it too.
 //  - The panel: type or paste text and send it.
+//  - Without the agent (BIOS, installers, login screens, guests without
+//    spice-vdagent): the panel's "Type into guest" types the box's text as
+//    key presses, mapped for a US keyboard layout in the guest.
 // Guest -> browser: when something in the guest copies text, the daemon
 // fetches it and we write it to the local clipboard. Without a recent click
 // or key press some browsers refuse; then it waits for the next one (and the
@@ -26,7 +29,7 @@ const FLAG_REPLAY = 1;    // S_CLIPBOARD sent on connect: show only
 const PASTE_WAIT_MS = 150; // for the paste event, then the key goes anyway
 const GRAB_LEAD_MS = 40;   // let the agent take the clipboard before the key
 
-let api = null;             // { send(text), keyEvent(down, code) }
+let api = null;             // { send(text), keyEvent(down, code), connected() }
 let state = { available: false, to_guest: false, from_guest: false, max: 1 << 20, reason: 'not connected' };
 let shared = null;          // latest text either way (what a guest paste gives)
 let pendingWrite = null;    // guest text not yet in the local clipboard
@@ -59,6 +62,82 @@ function updateUi() {
     $('clipsend').disabled = !canSend();
     $('clippaste').disabled = !canSend() || !navigator.clipboard?.readText;
     $('clipcopy').disabled = !navigator.clipboard?.writeText;
+    const tb = $('cliptype');
+    tb.disabled = !typing && !api.connected();
+    tb.textContent = typing ? `Stop typing (${Math.floor(typing.i * 100 / typing.events.length)} %)` : 'Type into guest';
+}
+
+// --- typing the box's text as key presses (needs no agent in the guest)
+// Character -> [KeyboardEvent.code, shift] for a US layout: the guest maps
+// scancodes with its own layout, like a physical keyboard.
+const TYPE_MAP = (() => {
+    const m = new Map();
+    for (let i = 0; i < 26; i++) {
+        const l = String.fromCharCode(97 + i), code = 'Key' + l.toUpperCase();
+        m.set(l, [code, false]); m.set(l.toUpperCase(), [code, true]);
+    }
+    const shifted = ')!@#$%^&*(';
+    for (let d = 0; d < 10; d++) { m.set(String(d), ['Digit' + d, false]); m.set(shifted[d], ['Digit' + d, true]); }
+    for (const [a, b, code] of [['-', '_', 'Minus'], ['=', '+', 'Equal'], ['[', '{', 'BracketLeft'],
+        [']', '}', 'BracketRight'], ['\\', '|', 'Backslash'], [';', ':', 'Semicolon'], ["'", '"', 'Quote'],
+        ['`', '~', 'Backquote'], [',', '<', 'Comma'], ['.', '>', 'Period'], ['/', '?', 'Slash']]) {
+        m.set(a, [code, false]); m.set(b, [code, true]);
+    }
+    m.set(' ', ['Space', false]); m.set('\n', ['Enter', false]); m.set('\t', ['Tab', false]);
+    return m;
+})();
+// One key event per step. The guest's keyboard has a short queue (USB HID: 16
+// events), so typing at full speed would drop keys.
+const TYPE_STEP_MS = 12;
+const TYPE_CONFIRM_CHARS = 2000;
+let typing = null;          // { events: [[down, code]], i, chars, skipped, timer, held }
+
+function typeStep() {
+    const t = typing;
+    if (!t) return;
+    if (t.i >= t.events.length) {
+        typing = null;
+        api.notice(`Typed ${t.chars} characters into the guest` +
+            (t.skipped ? ` (${t.skipped} skipped: not on a US keyboard)` : ''));
+        updateUi();
+        return;
+    }
+    const [down, code] = t.events[t.i++];
+    api.keyEvent(down, code);
+    if (down) t.held.add(code); else t.held.delete(code);
+    if (t.i % 20 === 0) updateUi();
+    t.timer = setTimeout(typeStep, TYPE_STEP_MS);
+}
+
+function startTyping(text) {
+    const events = [];
+    let chars = 0, skipped = 0;
+    for (const ch of text.replace(/\r\n?/g, '\n')) {
+        const k = TYPE_MAP.get(ch);
+        if (!k) { skipped++; continue; }
+        chars++;
+        if (k[1]) events.push([true, 'ShiftLeft']);
+        events.push([true, k[0]], [false, k[0]]);
+        if (k[1]) events.push([false, 'ShiftLeft']);
+    }
+    if (!chars) { api.notice(text ? 'Nothing to type: only characters a US keyboard can\'t type' : 'The box is empty'); return; }
+    const secs = Math.ceil(events.length * TYPE_STEP_MS / 1000);
+    if (chars > TYPE_CONFIRM_CHARS && !confirm(`Type ${chars} characters into the guest? This takes about ${secs} s.`)) return;
+    typing = { events, i: 0, chars, skipped, timer: null, held: new Set() };
+    api.notice(`Typing ${chars} characters into the guest…` + (secs > 3 ? ` (about ${secs} s)` : ''));
+    updateUi();
+    typeStep();
+}
+
+function stopTyping(why) {
+    const t = typing;
+    if (!t) return;
+    typing = null;
+    clearTimeout(t.timer);
+    for (const code of t.held) api.keyEvent(false, code);
+    const done = t.events.slice(0, t.i).filter(([d, c]) => !d && c !== 'ShiftLeft').length;
+    api.notice(`Typing stopped${why ? ' (' + why + ')' : ''} after ${done} of ${t.chars} characters`);
+    updateUi();
 }
 
 // --- browser -> guest
@@ -110,6 +189,12 @@ export function onKeyUp(ev) {
 export function reset() {
     if (pendingKey) clearTimeout(pendingKey.timer);
     pendingKey = null;
+}
+// all keys released (console hidden, disconnected): stop typing too, it would
+// go on with keys released mid-character, or at 1 char/s in a background tab
+export function releaseKeys() {
+    reset();
+    stopTyping('the console was hidden or disconnected');
 }
 
 function onPaste(ev) {
@@ -218,6 +303,7 @@ export function init(a) {
             api.notice('The browser did not allow reading the clipboard: paste into the box with Ctrl+V instead');
         }
     };
+    $('cliptype').onclick = () => { if (typing) stopTyping(); else startTyping($('cliptext').value); };
     $('clipcopy').onclick = async () => {
         if (await writeLocal($('cliptext').value)) api.notice('Copied to your clipboard');
         else api.notice('The browser did not allow writing the clipboard');
@@ -226,4 +312,4 @@ export function init(a) {
 }
 
 // for tests
-export function debugState() { return { state, shared, pendingWrite, pendingKey: !!pendingKey, auto: auto() }; }
+export function debugState() { return { state, shared, pendingWrite, pendingKey: !!pendingKey, auto: auto(), typing: typing && { i: typing.i, n: typing.events.length } }; }

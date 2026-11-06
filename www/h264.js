@@ -562,7 +562,7 @@ function keyEvent(down, code) {
     return true;
 }
 function releaseAll() {
-    CB.reset();
+    CB.releaseKeys();
     for (const code of [...pressed]) keyEvent(false, code);
     for (let b = 0; b < 8; b++) if (buttons & (1 << b)) { sendBtn(false, b); }
     buttons = 0;
@@ -754,6 +754,7 @@ function initToolbar() {
     CB.init({
         send: (text) => sendStr(C.CLIPBOARD, text),
         keyEvent,
+        connected: () => connected,
         notice: showNotice,
         focus: () => canvas.focus(),
         closeOthers: () => { if (S_.isOpen()) S_.toggle(false); togglePowerMenu(false); RH.close(); },

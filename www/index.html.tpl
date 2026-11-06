@@ -55,9 +55,10 @@
                 <button id="clipsend" title="Put this text on the guest's clipboard">Send to guest</button>
                 <button id="clippaste" title="Read your clipboard and send it to the guest">Send my clipboard</button>
                 <button id="clipcopy" title="Put this text on your local clipboard">Copy here</button>
+                <button id="cliptype" title="Type this text into the guest as key presses. Works without the spice agent (BIOS, installers, login screens); the guest's keyboard layout must be US">Type into guest</button>
             </div>
             <label class="c-auto" title="Ctrl+V in the console sends your clipboard to the guest first; text copied in the guest goes to your clipboard"><input type="checkbox" id="clipauto"> Sync automatically</label>
-            <div class="p-note">Ctrl+V (Shift+Insert) in the console pastes your clipboard into the guest; text copied in the guest goes to your clipboard. Needs the spice agent in the guest (spice-vdagent, or the virtio-win guest tools).</div>
+            <div class="p-note">Ctrl+V (Shift+Insert) in the console pastes your clipboard into the guest; text copied in the guest goes to your clipboard. Needs the spice agent in the guest (spice-vdagent, or the virtio-win guest tools). Without it, <em>Type into guest</em> types the box's text as key presses (US keyboard layout in the guest).</div>
         </div>
         <div id="resizepanel" hidden>
             <div class="p-head"><strong id="resizetitle">Resize guest</strong><span id="resizeinfo" class="p-enc"></span><button id="resizeclose" class="p-close" title="Close">×</button></div>
