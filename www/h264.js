@@ -761,6 +761,7 @@ function initToolbar() {
     });
     RH.init({
         vmid,
+        vmConfig: () => api('GET', `/nodes/${node}/qemu/${vmid}/config`),
         notice: showNotice,
         focus: () => canvas.focus(),
         closeOthers: () => { if (S_.isOpen()) S_.toggle(false); togglePowerMenu(false); CB.close(); },

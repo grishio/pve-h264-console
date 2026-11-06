@@ -224,11 +224,21 @@ version. If B has none (or an old one), A reports that instead of failing obscur
    OS id from `guest-get-osinfo` reduced to `[a-z0-9._-]`, whether the QEMU
    guest agent and spice-vdagent answer; once per size, `{ok:true}` after a
    resize succeeds, and to a viewer that connects while it's failed). The
-   viewer then shows a **Fix resize** button next to *Resize guest*: its panel
-   (`www/resizehelp.js`) gives the steps for that guest (Windows: guest agent,
-   logged-in user, `vga: virtio`; Linux: a one-off `hyprctl` command and a udev
-   hook for Hyprland, `swaymsg` for sway, spice-vdagent for X11 desktops) with
-   Copy buttons. The button goes away when the guest reaches that size
+   viewer then shows a **Fix resize** button next to *Resize guest*. Its
+   panel (`www/resizehelp.js`) reads the VM config with the viewer's own
+   permissions (`GET …/config`, VM.Audit; without it, the guest agent's OS id)
+   and picks the steps by the Proxmox **OS type**: Windows gets a checklist
+   (display `virtio`, VirtIO GPU DOD driver in Device Manager, guest agent
+   enabled in Proxmox and answering, a logged-in user), each marked ✓/✗ where
+   the config or the daemon can tell. Linux gets the display check and a
+   desktop picker (remembered per VM): GNOME and KDE follow by themselves
+   (fixed resolutions saved in their settings, spice-vdagent on X11), Hyprland
+   and sway need the exact size, because they keep the mode list from login
+   (a one-off `hyprctl eval` / `swaymsg` command, and a udev hook that reads
+   the kernel's new preferred mode from `/sys/class/drm/*/modes`, accepts only
+   `WxH`, and passes it to every running session), X11 desktops need
+   spice-vdagent (install command by distribution). Commands have Copy
+   buttons. The button goes away when the guest reaches that size
    (`S_VIDEO_CONFIG`), when *Resize guest* is unticked, or on reconnect.
 10. **libavcodec's NVENC reconfigure forces an IDR**: changing `rc_max_rate` /
    `bit_rate` at runtime makes FFmpeg call `nvEncReconfigureEncoder` with
@@ -972,7 +982,7 @@ offset.
 | VM on another node: connects, then closes at once | task log of the `h264relay` task on the node you're connected to (`ssh`/`socat` errors); on the VM's node `journalctl -u pve-h264d@<vmid>`; check `ssh root@<node>` works from the node you're connected to (`pvecm updatecerts` repairs cluster SSH keys) |
 | "failed to start H.264 console daemon" | `journalctl -u pve-h264d@<vmid>` |
 | Clipboard unavailable / not working | the panel (📋 Clipboard) shows the reason; `journalctl -u pve-h264d@<vmid> \| grep -i "clipboard\|vdagent"`. "no spice agent port" = `vga` isn't virtio/qxl, or the VM was started before the install (stop + start); "not running" = start the spice agent in the guest (Windows: *spice-agent* service from the virtio-win guest tools; Linux: `spice-vdagent`, needs an X11/XWayland session for the clipboard). Pasting does nothing: the browser must allow clipboard access for the PVE page; the panel's box always works (paste into it, *Send to guest*) |
-| "Guest did not resize to WxH" on a Linux guest | the guest's compositor ignores virtio-gpu resize hints (Hyprland/Omarchy, sway; §4.8). Set the resolution in the guest, or let the guest re-pick the preferred mode on each hint, e.g. for Hyprland a udev rule `/etc/udev/rules.d/99-vm-resize.rules`: `ACTION=="change", SUBSYSTEM=="drm", RUN+="/usr/local/bin/vm-resize"`, where `vm-resize` runs `hyprctl keyword monitor ,preferred,auto,1` as the session user (`HYPRLAND_INSTANCE_SIGNATURE` and `XDG_RUNTIME_DIR` of that session) |
+| "Guest did not resize to WxH" / **Fix resize** button | the button's panel checks the VM config (OS type, display, guest agent) and the agents and lists the steps for that guest. Hyprland (Omarchy) and sway keep the mode list from login, so "preferred" stays the old size: the guest has the new size as the first line of `/sys/class/drm/card*-Virtual-1/modes`, and `hyprctl eval 'hl.monitor({ output = "Virtual-1", mode = "WxH", position = "auto", scale = "auto" })'` (Hyprland 0.55+, Lua config; `hyprctl keyword` is rejected there) or `swaymsg output Virtual-1 mode WxH` switches to it. The panel's udev hook (`/usr/local/bin/vm-resize`) does that after every resize. Run `hyprctl` as the desktop user, not root (root has no `HYPRLAND_INSTANCE_SIGNATURE`) |
 | Windows guest doesn't resize | `journalctl -u pve-h264d@<vmid> \| grep -i "resize\|vdagent"`: `guest-exec resize:` lines give the reason (agent not responding, nobody logged in, Win32 error from SetDisplayConfig); for the spice agent path: "not on D-Bus" = VM started before the update (stop + start); no "guest agent connected" = `spice-agent` service not running in the guest; guest log `No suitable mode found` = the driver doesn't list that size (hint not applied yet, or larger than its framebuffer) |
 | Sound stutters / clicks; Stats show `source −2.x %` or `rate −0.5 %` with dropouts | the VM still runs with QEMU's default 10 ms audio timer, which delivers ~2–3 % too few samples: stop + start the VM (`qm showcmd <vmid> \| grep -o 'audiodev [^ ]*'` should contain `timer-period=5000`). Jitter of hundreds of ms on a busy host = QEMU stalls under CPU load (§4.11) |
 | Black screen / waiting for video | viewer Stats overlay; `PVE_H264D_DEBUG=1`; check the browser console for decoder errors |
@@ -1198,3 +1208,15 @@ offset.
   holds 16 events), with progress and *Stop typing* on the button; longer
   than 2000 characters asks first. Hiding the console or a disconnect stops
   it and releases held keys. Tested in headless Chromium (event sequence).
+* 2026-11-06 — **Fix resize panel by OS type.** The panel reads the VM config
+  and picks the steps by the Proxmox OS type instead of only the guest
+  agent's answer: Windows gets a checklist (display, VirtIO GPU driver in
+  Device Manager with the virtio-win ISO folder for that Windows version,
+  guest agent enabled / answering, logged-in user), Linux a desktop picker
+  (GNOME, KDE Plasma, Hyprland/Omarchy, sway, X11 desktops). Found on
+  Omarchy (Hyprland 0.56.2): `hyprctl keyword` is rejected by the Lua config
+  parser, and `hl.monitor` with `mode = "preferred"` keeps the old size
+  because Hyprland doesn't re-read the mode list; the exact size works. The
+  udev hook now reads the size from `/sys/class/drm` and uses `eval` (plus
+  `keyword` for older Hyprland, and sway). The hook itself is not yet
+  verified end to end on a guest.

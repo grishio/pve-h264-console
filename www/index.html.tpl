@@ -61,7 +61,8 @@
             <div class="p-note">Ctrl+V (Shift+Insert) in the console pastes your clipboard into the guest; text copied in the guest goes to your clipboard. Needs the spice agent in the guest (spice-vdagent, or the virtio-win guest tools). Without it, <em>Type into guest</em> types the box's text as key presses (US keyboard layout in the guest).</div>
         </div>
         <div id="resizepanel" hidden>
-            <div class="p-head"><strong id="resizetitle">Resize guest</strong><span id="resizeinfo" class="p-enc"></span><button id="resizeclose" class="p-close" title="Close">×</button></div>
+            <div class="p-head"><strong id="resizetitle">Resize guest</strong><span class="p-enc"></span><button id="resizeclose" class="p-close" title="Close">×</button></div>
+            <div id="resizeinfo" class="r-info"></div>
             <div id="resizebody"></div>
         </div>
         <div id="startdlg" hidden>
