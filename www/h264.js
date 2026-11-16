@@ -189,14 +189,87 @@ function onDecodeError(e) {
     if (decoderCfg) { configureDecoder(decoderCfg); send(C.KEYFRAME); }
 }
 
+// ---------------------------------------------------------------- in-band audio
+// Guest audio travels inside the H.264 stream: one SEI NAL unit
+// (user_data_unregistered, our UUID) per 10 ms packet, in front of the
+// slices of the next frame, or alone in an audio-only access unit when no
+// frame is going out. They are taken out here and the rest is decoded as is.
+const AUDIO_UUID = [0x3f, 0x0b, 0x8a, 0x6e, 0x5c, 0x21, 0x4d, 0x97,
+    0xb4, 0xe2, 0x91, 0xa7, 0xc6, 0xd0, 0x5f, 0x18];
+const FRAME_AUDIO = 2; // access unit with only audio SEI
+
+// remove emulation prevention bytes (00 00 03 -> 00 00)
+function unescapeRbsp(d) {
+    const o = new Uint8Array(d.length);
+    let n = 0, z = 0;
+    for (let i = 0; i < d.length; i++) {
+        const b = d[i];
+        if (z >= 2 && b === 3) { z = 0; continue; }
+        o[n++] = b;
+        z = b === 0 ? z + 1 : 0;
+    }
+    return o.subarray(0, n);
+}
+
+// SEI NAL payload (after the NAL header byte): true if it was our audio
+function seiAudio(nal) {
+    // cheap check first: payload type 5 and our UUID right after the size
+    if (nal[0] !== 5) return false;
+    const rb = unescapeRbsp(nal);
+    let i = 1, size = 0;
+    while (rb[i] === 255) { size += 255; i++; }
+    size += rb[i++];
+    if (size < 33 || i + size > rb.length) return false;
+    for (let k = 0; k < 16; k++) if (rb[i + k] !== AUDIO_UUID[k]) return false;
+    if (rb[i + 16] !== 1) return true; // a newer version: ours, but not understood
+    const h = new DataView(rb.buffer, rb.byteOffset + i + 17, 16);
+    A.onAudio(h.getUint32(0, true), Number(h.getBigUint64(4, true)), h.getUint8(12), h.getUint8(13),
+        h.getUint16(14, true), rb.subarray(i + 33, i + size));
+    return true;
+}
+
+// Hand the audio SEI of an access unit to the audio player; returns the
+// access unit without them (the same array if there were none). Only the
+// NAL units before the first slice are looked at.
+function takeAudio(data) {
+    const n = data.length;
+    let cut = null, nalAt = -1, nalBegin = 0;
+    const endNal = (end) => {
+        if (nalAt < 0) return;
+        if ((data[nalAt] & 0x1f) === 6 && seiAudio(data.subarray(nalAt + 1, end))) (cut ??= []).push([nalBegin, end]);
+    };
+    for (let i = 0; i + 3 < n; i++) {
+        if (data[i + 2] > 1) { i += 2; continue; }
+        if (data[i] || data[i + 1] || data[i + 2] !== 1) continue;
+        const begin = i > 0 && data[i - 1] === 0 ? i - 1 : i;
+        endNal(begin);
+        const t = data[i + 3] & 0x1f;
+        if (t >= 1 && t <= 5) { nalAt = -1; break; } // first slice: SEI only come before it
+        nalAt = i + 3; nalBegin = begin; i += 2;
+    }
+    endNal(n);
+    if (!cut) return data;
+    let len = n;
+    for (const [b, e] of cut) len -= e - b;
+    const out = new Uint8Array(len);
+    let o = 0, from = 0;
+    for (const [b, e] of cut) { out.set(data.subarray(from, b), o); o += b - from; from = e; }
+    out.set(data.subarray(from), o);
+    return out;
+}
+
 function onVideoFrame(dv, off, len) {
     const id = dv.getUint32(off, true);
-    const key = dv.getUint8(off + 4) & 1;
+    const flags = dv.getUint8(off + 4);
+    const key = flags & 1;
+    let data = new Uint8Array(dv.buffer, dv.byteOffset + off + 17, len - 17);
+    local.bytes += data.byteLength;
+    // the audio first: it was captured before this frame
+    if (flags & FRAME_AUDIO) { takeAudio(data); return; } // no picture, not ACKed
+    data = takeAudio(data);
     local.encMs = local.encMs * 0.9 + dv.getUint32(off + 5, true) / 10000;
     const cap = Number(dv.getBigUint64(off + 9, true));
     A.observeVideo(cap);
-    const data = new Uint8Array(dv.buffer, dv.byteOffset + off + 17, len - 17);
-    local.bytes += data.byteLength;
     if (!decoder || decoder.state !== 'configured') { sendU32s(C.ACK, id, 0); return; }
     if (waitKey && !key) { sendU32s(C.ACK, id, 0); local.dropped++; return; }
     waitKey = false;

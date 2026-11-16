@@ -10,7 +10,7 @@ CFLAGS += $(shell pkg-config --cflags $(PKGS)) -pthread
 LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread -lm
 PREFIX ?= /usr/local
 
-pve-h264d: pve-h264d.o encoder.o sps.o probe.o vdagent.o guestexec.o audio.o
+pve-h264d: pve-h264d.o encoder.o sps.o probe.o vdagent.o guestexec.o audio.o sei.o
 	$(CC) -o $@ $^ $(LDLIBS)
 
 %.o: %.c pve-h264d.h

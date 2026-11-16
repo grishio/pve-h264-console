@@ -219,14 +219,14 @@ function build() {
         panel.append(el('div', { class: 'p-sec' }, 'Sound (this browser)'));
         const ag = el('div', { class: 'p-grid' });
         const ls = el('select', { id: 'set-lipsync' });
-        ls.add(new Option('Off · lowest latency', '0'));
         ls.add(new Option('On · hold video for its audio', '1'));
+        ls.add(new Option('Off · lowest video latency', '0'));
         ls.value = audio.getLipSync() ? '1' : '0';
         ls.addEventListener('change', () => audio.setLipSync(ls.value === '1'));
         ag.append(el('div', { class: 'p-row' },
             el('label', { htmlFor: 'set-lipsync' }, 'Lip sync'),
             el('div', { class: 'p-ctl' }, ls),
-            el('div', { class: 'p-help' }, 'Audio and video carry the same host timestamps. Off: every frame is drawn the moment it decodes and audio keeps the smallest buffer that doesn\'t stutter, usually 20–50 ms behind the picture (the stats show the offset). On: frames wait until their sound is heard, for videos and calls; the picture then lags by that much too.')));
+            el('div', { class: 'p-help' }, 'The sound travels inside the H.264 stream, with the same host timestamps as the picture. On (default): each frame waits until its sound is heard, so picture and sound stay together; the picture lags by the audio buffer, usually 20–50 ms. Off: every frame is drawn the moment it decodes and the sound follows that much behind (the stats show the offset).')));
         const vol = el('input', { id: 'set-volume', type: 'range', min: 0, max: 100, step: 1 });
         const vv = el('output', { class: 'p-val', htmlFor: 'set-volume' });
         vol.value = Math.round(audio.getVolume() * 100);

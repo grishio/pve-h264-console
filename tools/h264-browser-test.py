@@ -91,7 +91,7 @@ if action == "perf":
 if action == "audio":
     # sound on (a click is the user gesture), lip sync per LIPSYNC=0/1, then
     # the audio stats every 5 s for SECS seconds
-    js(f"localStorage.setItem('pve-h264-audio','1'); localStorage.setItem('pve-h264-lipsync','{os.environ.get('LIPSYNC', '1')}')")
+    js(f"localStorage.setItem('pve-h264-audio','1'); localStorage.setItem('pve-h264-avsync','{os.environ.get('LIPSYNC', '1')}')")
     call("Page.reload"); pump(5)
     call("Input.dispatchMouseEvent", type="mousePressed", x=5, y=5, button="left", clickCount=1)
     call("Input.dispatchMouseEvent", type="mouseReleased", x=5, y=5, button="left", clickCount=1)

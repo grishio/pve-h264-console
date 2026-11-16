@@ -2,10 +2,12 @@
 // PVE H.264 console: guest audio and lip sync (main thread).
 //
 // pve-h264d sends 10 ms audio packets (Opus, or raw PCM for browsers without
-// an Opus AudioDecoder) on the same WebSocket as the video. Both carry the
-// host time (CLOCK_MONOTONIC, µs) at which the daemon got them from QEMU:
-// a video frame its capture time, an audio packet the time its first sample
-// started "playing". Nothing is muxed; this is what keeps them in sync:
+// an Opus AudioDecoder) inside the H.264 stream, as SEI NAL units that ride
+// in the video's access units (h264.js takes them out; daemons from before
+// that send them as separate S_AUDIO messages). Both carry the host time
+// (CLOCK_MONOTONIC, µs) at which the daemon got them from QEMU: a video frame
+// its capture time, an audio packet the time its first sample started
+// "playing". This is what keeps them in sync:
 //
 //  clock   off = min(arrival - host time) over the last 5-10 s, for both
 //          streams. Unknown network delay and clock offset are folded into
@@ -14,13 +16,14 @@
 //          the worklet's reports and AudioContext.getOutputTimestamp().
 //  video   delay = (when a frame is drawn) - (its capture time + off).
 //
-// Lip sync off (default): video is drawn the moment it decodes, audio keeps
-// the smallest jitter buffer that doesn't underrun; the A/V offset is only
-// shown in the stats. Lip sync on: decoded frames wait until their audio is
-// heard (audio usually lags by its jitter buffer), and if video is the later
-// one, the audio buffer grows to match it.
+// Lip sync on (default): decoded frames wait until their audio is heard
+// (audio usually lags by its jitter buffer), and if video is the later one,
+// the audio buffer grows to match it. Lip sync off: video is drawn the
+// moment it decodes, audio keeps the smallest jitter buffer that doesn't
+// underrun; the A/V offset is only shown in the stats.
 const MODE = { OFF: 0, OPUS: 1, PCM: 2 };
 const C_AUDIO = 0x0b;
+const INBAND = 1; // C_AUDIO flag: audio inside the H.264 stream
 const RATE = 48000;
 
 const store = {
@@ -34,7 +37,9 @@ let server = { available: false, reason: 'starting' };
 let wsUp = false;
 let pref = store.get('audio', '1') === '1';
 let volume = Math.min(1, Math.max(0, parseFloat(store.get('audio-vol', '1')) || 0));
-let lipSync = store.get('lipsync', '0') === '1';
+// on by default since audio rides in the video stream ('lipsync' was the
+// old off-by-default setting; a new key so everyone starts in sync)
+let lipSync = store.get('avsync', '1') === '1';
 let opusOk = null; // AudioDecoder can decode Opus (probed)
 
 let ctx = null, node = null, gain = null, ctxStarting = null;
@@ -110,14 +115,17 @@ export function videoDrawn(capUs) {
 function audioActive() { return workletPlaying && performance.now() - aDelayAt < 300; }
 
 // ------------------------------------------------------------------ packets
+// S_AUDIO message (daemons without in-band audio)
 export function onPacket(dv, off, len) {
+    onAudio(dv.getUint32(off, true), Number(dv.getBigUint64(off + 4, true)), dv.getUint8(off + 12),
+        dv.getUint8(off + 13), dv.getUint16(off + 14, true),
+        new Uint8Array(dv.buffer, dv.byteOffset + off + 16, len - 16));
+}
+
+// one 10 ms packet, from the H.264 stream's SEI or an S_AUDIO message
+export function onAudio(seq, ts, codec, ch, n, data) { // eslint-disable-line no-unused-vars
     const now = performance.now();
-    const seq = dv.getUint32(off, true); // eslint-disable-line no-unused-vars
-    const ts = Number(dv.getBigUint64(off + 4, true));
-    const codec = dv.getUint8(off + 12);
-    const ch = dv.getUint8(off + 13);
-    const n = dv.getUint16(off + 14, true);
-    const data = new Uint8Array(dv.buffer, dv.byteOffset + off + 16, len - 16);
+    const len = data.length + 16;
     clockObserve(ts, now);
     if (now - lastPacket > 500) { streamStart = now; pktEnd = 0; }
     // the source itself paused (the guest stopped its stream, QEMU stalled):
@@ -306,7 +314,7 @@ function wantedMode() {
 function update() {
     const m = wantedMode();
     if (m !== sentMode && wsUp) {
-        sendFn(C_AUDIO, new Uint8Array([m]));
+        sendFn(C_AUDIO, new Uint8Array([m, INBAND]));
         if (m !== MODE.OFF && sentMode <= MODE.OFF) audioOnAt = performance.now();
         sentMode = m;
         if (m !== MODE.OPUS && decoder) { try { decoder.close(); } catch { /* closed */ } decoder = null; }
@@ -360,7 +368,7 @@ export function setVolume(v) {
     if (gain) gain.gain.value = volume;
 }
 export function getVolume() { return volume; }
-export function setLipSync(on) { lipSync = !!on; store.set('lipsync', lipSync ? '1' : '0'); if (!lipSync) extra = 0; updateTarget(); }
+export function setLipSync(on) { lipSync = !!on; store.set('avsync', lipSync ? '1' : '0'); if (!lipSync) extra = 0; updateTarget(); }
 export function getLipSync() { return lipSync; }
 
 export function statsLine() {

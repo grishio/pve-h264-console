@@ -63,7 +63,8 @@ pve-h264d@V.service   (one daemon per VM, root, started on demand, exits 30 s af
    │  adaptive VBR ceiling, NVENC(CUDA dirty-rect) | NVENC(sysmem) | VA-API | x264
    ├─ SPS rewrite (VUI bitstream_restriction, max_num_reorder_frames=0)
    ├─ audio thread: Audio.RegisterOutListener → PCM → 48 kHz stereo → Opus 10 ms
-   │  (or raw PCM), stamped with the same host clock as the video frames
+   │  (or raw PCM), stamped with the same host clock as the video frames,
+   │  carried inside the H.264 stream as SEI NAL units
    └─ fan-out of the single encoded stream to all authenticated viewers
 QEMU  (-display dbus,p2p=yes[,audiodev=X] + -audiodev dbus,id=X added by the
        patched qemu-server, alongside the normal -vnc)
@@ -310,9 +311,30 @@ version. If B has none (or an old one), A reports that instead of failing obscur
   (CELT only, 2.5 ms lookahead), 128 kbit/s VBR (~60–90 kbit/s measured), only
   while a viewer wants it; raw PCM for viewers without an Opus `AudioDecoder`
   (1.5 Mbit/s). Not ACK-paced; packets keep flowing while video is paced.
-* **Why not mux**: a container (MP4/MPEG-TS/WebM through MSE) only adds the
-  player's buffering, 100 ms or more. Sync comes from timestamps, so the two
-  streams share the WebSocket, each with its own decoder.
+* **In the H.264 stream** (`daemon/sei.c`): each 10 ms packet is one SEI NAL
+  unit (`user_data_unregistered`, payload type 5) with our UUID
+  `3f0b8a6e-5c21-4d97-b4e2-91a7c6d05f18`, then a version byte (1), the
+  16-byte audio header (`u32 seq, u64 ts_us, u8 codec, u8 channels,
+  u16 samples`) and the Opus packet or PCM, with emulation prevention
+  bytes. Decoders must skip SEI they don't know, so it stays plain H.264
+  (FFmpeg decodes a captured stream with and without them to identical
+  pictures). The packet goes in front of the slices of the next video frame
+  the viewer is sent, in the same access unit. The encoder thread marks a
+  frame "open" from just before it encodes until it has sent it. Audio that
+  comes in while no frame is open (a static screen, between frames), that
+  has waited 6 ms for one (a slow x264 encode), or that is for a viewer whose
+  frame is skipped by ACK pacing goes out at once as an **audio-only access
+  unit**: an S_FRAME with flag `0x02`, id 0, only SEI, not decoded and not
+  ACKed. Audio is never held back by more than one encode, and never by
+  pacing. A per-viewer lock covers queueing and sending, so audio stays in
+  order with the frames that carry it. The viewer (`takeAudio` in
+  `h264.js`) looks at the NAL units before the first slice, hands ours to
+  `audio.js`, and decodes the rest. Viewers ask for this with the
+  `AUDIO_FLAG_INBAND` byte in `C_AUDIO`; older viewers still get `S_AUDIO`
+  messages.
+* **Why not a container**: MP4/MPEG-TS/WebM through MSE and a `<video>`
+  element adds the player's buffering, 100 ms or more. Sync comes from the
+  shared timestamps, and each stream keeps its own decoder.
 * **Timestamps**: video `capture_us` = when the encoder took the frame;
   audio `ts_us` = when its first sample "started playing" (the `Write`
   arrival, like a sound card starting a buffer). Both are CLOCK_MONOTONIC.
@@ -405,8 +427,10 @@ version. If B has none (or an old one), A reports that instead of failing obscur
   Resampling (drift control, contexts not at 48 kHz) uses 4-point Hermite
   interpolation. Stats show `rate ±x %` while it is adjusting. Guest volume
   changes glide over ~3 ms in the daemon instead of stepping.
-* **Lip sync** (*Sound* section of the settings panel): off by default (each
-  frame drawn the moment it decodes). On: a decoded frame waits until its
+* **Lip sync** (*Sound* section of the settings panel): **on by default**
+  since audio is in the H.264 stream (stored as `avsync`; the old
+  off-by-default `lipsync` setting is no longer read). Off: each frame is
+  drawn the moment it decodes. On: a decoded frame waits until its
   audio is heard (max 300 ms, frames superseded while waiting are skipped,
   timers corrected for their own lateness); if video is the later one, the
   audio buffer grows instead (max 200 ms). ACKs are sent at decode time, so a
@@ -420,13 +444,14 @@ version. If B has none (or an old one), A reports that instead of failing obscur
 | `daemon/pve-h264d.c` | daemon: QMP attach, D-Bus listener, clients/protocol, encoder thread, ABR, test pattern |
 | `daemon/encoder.c` | encoder backends (nvenc-cuda, nvenc sysmem, vaapi, x264) |
 | `daemon/sps.c` | H.264 SPS rewriter (no-reorder VUI) |
+| `daemon/sei.c` | guest audio packets as H.264 SEI NAL units (user_data_unregistered) |
 | `daemon/guestexec.c` | Windows guest resize through qemu-guest-agent (SetDisplayConfig in the user's session) |
 | `daemon/audio.c` | guest audio: D-Bus AudioOutListener (own thread), resampling, guest volume, Opus/PCM packets, test tone |
 | `daemon/vdagent.c` | spice-vdagent client on the D-Bus agent port (guest resize for Windows, clipboard) |
 | `daemon/probe.c` | `pve-h264d --probe`: test all encoder backends, explain failures |
 | `daemon/pve-h264d.h`, `daemon/Makefile` | shared header (wire protocol constants), build |
 | `www/index.html.tpl` | viewer page template (pveproxy injects user + CSRF token) |
-| `www/h264.js` | viewer: WebSocket, parser, WebCodecs, input, toolbar, stats |
+| `www/h264.js` | viewer: WebSocket, parser, takes the audio SEI out of the H.264 stream, WebCodecs, input, toolbar, stats |
 | `www/settings.js` | viewer: Stream settings panel (encoder profiles/tunables, guest resolution / DPI, scaling filter, lip sync, volume) |
 | `www/audio.js` | viewer: audio decode (WebCodecs Opus / PCM), jitter buffer control, A/V delay measurement, lip sync |
 | `www/audio-worklet.js` | viewer: AudioWorklet playout (ring buffer, rebuffering, drift catch-up) |
@@ -754,15 +779,15 @@ Every message: `u32 len (LE, = 1 + payload) | u8 type | payload`.
 | C→S | `0x0A RESIZE` | `u32 w, u32 h` in CSS pixels; clamped to 16 MiB of BGRX, debounced 150 ms → `Console.SetUIInfo`; Windows guest (known from the agent) → guest-agent listener `SetDisplayConfig` right away; others: if the scanout hasn't changed 1 s later → spice agent monitors config; outcome logged within 15 s |
 | S→C | `0x81 HELLO` | JSON (proto, vmid, mouse_abs, defaults) |
 | S→C | `0x82 VIDEO_CONFIG` | JSON `{codec, width, height, coded_width, coded_height, encoder}` |
-| S→C | `0x83 FRAME` | `u32 id, u8 flags(1=key), u32 encode_us, u64 capture_us, Annex-B H.264` |
+| S→C | `0x83 FRAME` | `u32 id, u8 flags, u32 encode_us, u64 capture_us, Annex-B H.264`. flags: `1` key, `2` audio-only access unit (id 0, `capture_us` = its first audio packet, only audio SEI: not decoded, not ACKed). For in-band viewers the access unit also carries audio SEI NAL units before its slices (§4.11) |
 | S→C | `0x84 CURSOR` | `i32 w,h,hot_x,hot_y` + RGBA |
 | S→C | `0x85 CURSOR_POS` | `i32 x, i32 y, u8 visible` |
 | S→C | `0x86 PONG`, `0x87 STATS` (JSON, 1 Hz; incl. `window`, `queue_ms`, `base_ms`, `paced_ms`), `0x88 ERROR` (text), `0x89 MOUSE_MODE` (`u8 abs`), `0x8A DISPLAY_OFF` | |
 | S→C | `0x8B SETTINGS` | JSON: effective settings (CONFIG keys) + `kind` (nvenc/vaapi/x264) + `encoder`; sent after HELLO, on every change and encoder reopen |
 | S→C | `0x8C NOTICE` | text, informational (e.g. tuning rejected by the GPU, reverted) |
-| C→S | `0x0B AUDIO` | `u8 mode`: 0 off, 1 Opus, 2 PCM. Off by default; the viewer turns it on once its AudioContext runs |
+| C→S | `0x0B AUDIO` | `u8 mode`: 0 off, 1 Opus, 2 PCM; optional `u8 flags`: `1` = in-band (audio inside the H.264 stream as SEI, no `S_AUDIO`). Off by default; the viewer turns it on once its AudioContext runs |
 | S→C | `0x8D AUDIO_STATE` | JSON `{available, playing, reason, rate, channels, src_rate, src_channels, opus, frame_ms}`; after HELLO and on changes. `reason`: `no-device`, `disabled`, `closed`, `error` |
-| S→C | `0x8E AUDIO` | `u32 seq, u64 ts_us, u8 codec (1 Opus, 2 PCM), u8 channels, u16 samples` + one Opus packet or `s16le` interleaved; 10 ms (480 samples at 48 kHz); `ts_us` = host time of the first sample, same clock as FRAME's `capture_us`. Not ACK-paced |
+| S→C | `0x8E AUDIO` | only for viewers without the in-band flag: `u32 seq, u64 ts_us, u8 codec (1 Opus, 2 PCM), u8 channels, u16 samples` + one Opus packet or `s16le` interleaved; 10 ms (480 samples at 48 kHz); `ts_us` = host time of the first sample, same clock as FRAME's `capture_us`. Not ACK-paced. The in-band SEI carries the same header and data |
 | C→S | `0x0C CLIPBOARD` | UTF-8 text (LF line ends, ≤ 1 MiB): the viewer's clipboard; the daemon grabs the guest clipboard for it. Larger than one websocket frame: the viewer splits the stream into ≤ 64 KiB frames (pveproxy drops frames > 128 KiB) |
 | S→C | `0x8F CLIPBOARD` | `u8 flags, UTF-8 text`: the guest's clipboard (LF). flags bit 0 = *replay*: the latest shared text, sent on connect and to other viewers when one pastes; shown in the panel, not written to the local clipboard |
 | S→C | `0x90 CLIPBOARD_STATE` | JSON `{available, to_guest, from_guest, max, reason}`; after HELLO and on every change (agent starts/stops) |
@@ -1249,3 +1274,22 @@ offset.
   it already applied. The daemon no longer asks a missing QEMU guest agent on every
   resize (each try waited for the agent timeout and logged a line): it
   retries at most every 60 s and logs the first miss only.
+* 2026-11-16 — **Guest audio inside the H.264 stream.** Each 10 ms audio
+  packet is now an SEI NAL unit (`user_data_unregistered`) in the video's
+  access units, instead of a separate `S_AUDIO` message: in front of the
+  next frame's slices when one is being encoded, otherwise right away in an
+  audio-only access unit, so a static screen, a slow encode or ACK pacing
+  never hold sound back (§4.11). The viewer takes these NAL units out before
+  decoding. **Lip sync is now on by default** (frames are shown when their
+  sound is heard); *Off* in the settings panel still draws frames the moment
+  they decode. Older viewers (cached JavaScript) keep getting `S_AUDIO`, and
+  the new viewer still plays `S_AUDIO` from an older daemon. No Proxmox patch
+  or QEMU change: running VMs need no restart, re-run `./install.sh` and
+  reload the viewer. Tested in `PVE_H264D_TEST` mode with NVENC: 100 audio
+  packets/s, none lost or reordered, capture → socket p50 1.0 ms / p99
+  4.5 ms; captured streams with and without the SEI decode to identical
+  pictures in FFmpeg; headless Chromium 156 played the in-band Opus, A/V
+  −10…−22 ms with lip sync on, 0 dropouts in 30 s (audio delay 250–340 ms,
+  most of it the headless fake output device). `uninstall.sh` then
+  `install.sh` checked: stock files restored, then all 12 patches back.
+  Not yet checked with a real guest playing sound or a desktop browser.

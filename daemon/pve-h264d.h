@@ -70,6 +70,9 @@ enum {
 };
 
 #define FRAME_FLAG_KEY 0x01
+/* S_FRAME with only in-band audio SEI, no picture (no video frame was going
+ * out to carry it): id 0, not decoded, not ACKed */
+#define FRAME_FLAG_AUDIO 0x02
 /* S_CLIPBOARD flags */
 #define CLIP_FLAG_REPLAY 0x01 /* sent on connect: show it, don't copy it locally */
 
@@ -78,6 +81,8 @@ enum { CLIP_TO_GUEST = 1, CLIP_FROM_GUEST = 2 };
 
 /* audio modes (C_AUDIO) = codec byte of S_AUDIO */
 enum { AUDIO_OFF = 0, AUDIO_OPUS = 1, AUDIO_PCM = 2 };
+/* optional 2nd byte of C_AUDIO */
+#define AUDIO_FLAG_INBAND 0x01 /* carry audio inside the H.264 stream (SEI) */
 #define AUDIO_RATE 48000
 #define AUDIO_CHANNELS 2
 #define AUDIO_FRAME 480 /* samples per packet: 10 ms */
@@ -156,6 +161,15 @@ int audio_modes_wanted(void);                   /* bitmask 1 << AUDIO_* */
 void audio_send(int mode, const void *hdr, size_t hl, const void *d, size_t dl);
 void audio_state_changed(void);
 bool av_test_flash(int64_t t_us);               /* test mode: beep + flash */
+
+/* sei.c: audio as H.264 SEI user_data_unregistered NAL units */
+#define H264_AUDIO_SEI_VERSION 1
+extern const uint8_t H264_AUDIO_SEI_UUID[16];
+/* one Annex-B SEI NAL (4-byte start code) for an audio packet; 0 if cap is
+ * too small (needs about 1.5 * (hl + dl) + 64) */
+size_t h264_sei_audio(uint8_t *out, size_t cap, const uint8_t *hdr, size_t hl,
+                      const uint8_t *d, size_t dl);
+size_t h264_first_vcl(const uint8_t *d, size_t n);
 
 /* sps.c */
 uint8_t *h264_fix_sps(const uint8_t *pkt, size_t n, size_t *outlen);

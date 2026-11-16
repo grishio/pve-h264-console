@@ -19,7 +19,7 @@ No client software. No extra ports. No QEMU fork. It's one more entry in the
   CPU x264 as a fallback) and decoded on the browser's GPU via WebCodecs.
 - ⚡ **Built for low latency.** No B-frames, no lookahead, no buffering, and frames drawn the
   moment they arrive. The bitrate adapts on its own, so a static screen costs almost nothing.
-- 🔊 **Guest audio with optional lip sync.**
+- 🔊 **Guest audio inside the H.264 stream,** lip-synced to the picture by default.
 - 📋 **Clipboard sharing** with the guest: paste in, copy out.
 - 🖥️ **The guest follows your window size,** including on Windows guests.
 - 🔐 **Same login, same permissions.** It uses Proxmox's own authentication and the

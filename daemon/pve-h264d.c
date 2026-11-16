@@ -273,6 +273,15 @@ typedef struct Client {
     uint8_t keys[64]; /* bitset of pressed qnums (0..511) */
     uint8_t buttons;
     atomic_int audio_mode; /* AUDIO_OFF | AUDIO_OPUS | AUDIO_PCM */
+    /* In-band audio (AUDIO_FLAG_INBAND): SEI NAL units waiting for the next
+     * video frame to this viewer (alock). The lock also orders them with the
+     * frames, so audio never overtakes a frame that carries older audio. */
+    atomic_bool audio_inband;
+    pthread_mutex_t alock;
+    uint8_t *apend;
+    size_t apend_len, apend_cap;
+    int64_t apend_ts;    /* host time of the first pending packet */
+    int64_t apend_since; /* when it was queued */
 } Client;
 
 static GPtrArray *g_clients;  /* Client*, protected by clients_lock */
@@ -287,21 +296,30 @@ static void client_unref(Client *c)
         close(c->fd);
         g_byte_array_unref(c->rbuf);
         pthread_mutex_destroy(&c->wlock);
+        pthread_mutex_destroy(&c->alock);
+        free(c->apend);
         free(c);
     }
 }
 
-static bool client_sendv(Client *c, uint8_t type, const void *a, size_t al,
-                         const void *b, size_t bl)
+/* one message: type + the concatenation of parts[0..np) (at most 4) */
+static bool client_sendiov(Client *c, uint8_t type, const struct iovec *parts, int np)
 {
     if (atomic_load(&c->dead))
         return false;
     uint8_t hdr[5];
-    uint32_t len = (uint32_t)(1 + al + bl);
+    struct iovec iov[5] = {{hdr, 5}};
+    size_t total = 1;
+    int n = 1;
+    for (int i = 0; i < np && n < 5; i++) {
+        if (!parts[i].iov_len)
+            continue;
+        iov[n++] = parts[i];
+        total += parts[i].iov_len;
+    }
+    uint32_t len = (uint32_t)total;
     memcpy(hdr, &len, 4); /* little endian host */
     hdr[4] = type;
-    struct iovec iov[3] = {{hdr, 5}, {(void *)a, al}, {(void *)b, bl}};
-    int n = 3;
     pthread_mutex_lock(&c->wlock);
     struct iovec *v = iov;
     while (n > 0) {
@@ -327,6 +345,13 @@ static bool client_sendv(Client *c, uint8_t type, const void *a, size_t al,
     }
     pthread_mutex_unlock(&c->wlock);
     return true;
+}
+
+static bool client_sendv(Client *c, uint8_t type, const void *a, size_t al,
+                         const void *b, size_t bl)
+{
+    struct iovec parts[2] = {{(void *)a, al}, {(void *)b, bl}};
+    return client_sendiov(c, type, parts, 2);
 }
 
 static bool client_send(Client *c, uint8_t type, const void *p, size_t l)
@@ -391,15 +416,89 @@ int audio_modes_wanted(void)
     return m & ~(1 << AUDIO_OFF);
 }
 
+/* In-band audio: each packet is an SEI NAL unit that rides in the next video
+ * access unit sent to the viewer. The encoder thread marks a frame "open"
+ * from just before it starts encoding until it has sent it; audio that
+ * arrives while no frame is open, or that has waited INBAND_HOLD_US for one
+ * (a slow software encode), goes out at once in an access unit of its own
+ * (FRAME_FLAG_AUDIO). So audio is delayed by at most one encode, and a
+ * static screen or ACK pacing never holds it back. */
+#define INBAND_HOLD_US 6000
+static atomic_bool g_frame_open;
+
+/* c->alock held */
+static void apend_add(Client *c, const uint8_t *sei, size_t n, int64_t ts)
+{
+    if (c->apend_len + n > c->apend_cap) {
+        size_t cap = c->apend_cap ? c->apend_cap * 2 : 8192;
+        while (cap < c->apend_len + n)
+            cap *= 2;
+        uint8_t *p = realloc(c->apend, cap);
+        if (!p)
+            return; /* drop the packet; the viewer plays a gap */
+        c->apend = p;
+        c->apend_cap = cap;
+    }
+    if (!c->apend_len) {
+        c->apend_ts = ts;
+        c->apend_since = now_us();
+    }
+    memcpy(c->apend + c->apend_len, sei, n);
+    c->apend_len += n;
+}
+
+/* c->alock held: send the pending audio as an audio-only access unit */
+static void apend_flush(Client *c)
+{
+    if (!c->apend_len)
+        return;
+    uint8_t hdr[17] = {0};
+    uint64_t cap = (uint64_t)c->apend_ts;
+    hdr[4] = FRAME_FLAG_AUDIO;
+    memcpy(hdr + 9, &cap, 8);
+    client_sendv(c, S_FRAME, hdr, sizeof(hdr), c->apend, c->apend_len);
+    c->apend_len = 0;
+}
+
+/* encoder thread, after a frame went out: audio queued for it after it had
+ * been sent to a viewer (or for viewers that weren't sent it) */
+static void apend_flush_all(void)
+{
+    atomic_store(&g_frame_open, false);
+    GPtrArray *a = clients_snapshot();
+    for (guint i = 0; i < a->len; i++) {
+        Client *c = a->pdata[i];
+        pthread_mutex_lock(&c->alock);
+        apend_flush(c);
+        pthread_mutex_unlock(&c->alock);
+    }
+    clients_release(a);
+}
+
 /* Audio is not ACK-paced: 10 ms packets are small, and they must keep
  * flowing while video frames are skipped for a slow viewer. */
 void audio_send(int mode, const void *hdr, size_t hl, const void *d, size_t dl)
 {
     GPtrArray *a = clients_snapshot();
+    uint8_t sei[4096];
+    size_t sl = 0;
+    int64_t ts;
+    memcpy(&ts, (const uint8_t *)hdr + 4, 8);
     for (guint i = 0; i < a->len; i++) {
         Client *c = a->pdata[i];
-        if (atomic_load(&c->audio_mode) == mode)
+        if (atomic_load(&c->audio_mode) != mode)
+            continue;
+        if (!atomic_load(&c->audio_inband)) {
             client_sendv(c, S_AUDIO, hdr, hl, d, dl);
+            continue;
+        }
+        if (!sl && !(sl = h264_sei_audio(sei, sizeof(sei), hdr, hl, d, dl)))
+            break; /* can't happen: 10 ms of s16 stereo fits */
+        pthread_mutex_lock(&c->alock);
+        apend_add(c, sei, sl, ts);
+        if (!atomic_load(&g_frame_open) || now_us() - c->apend_since >= INBAND_HOLD_US)
+            apend_flush(c);
+        pthread_mutex_unlock(&c->alock);
     }
     clients_release(a);
 }
@@ -1356,8 +1455,21 @@ static void on_packet(const uint8_t *data, size_t len, bool key, void *opaque)
             c->sent_us[id % ACK_RING] = t;
         }
         pthread_mutex_unlock(&clients_lock);
-        if (!skip)
+        pthread_mutex_lock(&c->alock);
+        if (skip) {
+            apend_flush(c); /* no frame for this viewer: audio goes alone */
+        } else if (c->apend_len) {
+            /* the audio this frame carries goes in front of its slices */
+            size_t at = h264_first_vcl(data, len);
+            struct iovec parts[4] = {{hdr, sizeof(hdr)}, {(void *)data, at},
+                                     {c->apend, c->apend_len},
+                                     {(void *)(data + at), len - at}};
+            client_sendiov(c, S_FRAME, parts, 4);
+            c->apend_len = 0;
+        } else {
             client_sendv(c, S_FRAME, hdr, sizeof(hdr), data, len);
+        }
+        pthread_mutex_unlock(&c->alock);
     }
     st.frames++;
     st.bytes += (int)len;
@@ -1572,8 +1684,10 @@ static void *encoder_thread(void *arg)
 
         fc.clients = clients_snapshot();
         fc.enc_start = now_us();
+        atomic_store(&g_frame_open, true);
         int r = encoder_encode(enc, idr, was_dirty ? rect : NULL, on_packet, &fc);
         clients_release(fc.clients);
+        apend_flush_all();
         if (r < 0)
             LOG("encode error %d", r);
 
@@ -2143,9 +2257,17 @@ static bool handle_msg(Client *c, uint8_t type, const uint8_t *p, size_t n)
     case C_AUDIO:
         if (n >= 1) {
             int m = p[0] <= AUDIO_PCM ? p[0] : AUDIO_OFF;
-            if (atomic_exchange(&c->audio_mode, m) != m)
-                LOG("client %d: audio %s", c->id,
-                    m == AUDIO_OPUS ? "on (opus)" : m == AUDIO_PCM ? "on (pcm)" : "off");
+            bool ib = n >= 2 && (p[1] & AUDIO_FLAG_INBAND);
+            bool ib_was = atomic_exchange(&c->audio_inband, ib);
+            if (ib_was && !ib) {
+                pthread_mutex_lock(&c->alock);
+                apend_flush(c);
+                pthread_mutex_unlock(&c->alock);
+            }
+            if (atomic_exchange(&c->audio_mode, m) != m || ib != ib_was)
+                LOG("client %d: audio %s%s", c->id,
+                    m == AUDIO_OPUS ? "on (opus)" : m == AUDIO_PCM ? "on (pcm)" : "off",
+                    m != AUDIO_OFF && ib ? ", in the H.264 stream" : "");
         }
         break;
     case C_CLIPBOARD:
@@ -2274,6 +2396,7 @@ static gboolean on_accept(gint lfd, GIOCondition cond, gpointer ud)
     c->net_min_ms = c->dec_min_ms = 1e9;
     c->window = 3; /* until the first round trips are measured */
     pthread_mutex_init(&c->wlock, NULL);
+    pthread_mutex_init(&c->alock, NULL);
     pthread_mutex_lock(&clients_lock);
     g_ptr_array_add(g_clients, c);
     pthread_mutex_unlock(&clients_lock);
